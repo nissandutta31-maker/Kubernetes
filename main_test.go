@@ -59,3 +59,30 @@ func TestMeasurableSummaryCalculatesTotalGPU(t *testing.T) {
 		t.Fatalf("expected replica value in summary, got: %s", summary)
 	}
 }
+
+func TestValidateOutputPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{name: "valid relative path", path: "demo.yaml", wantErr: false},
+		{name: "valid nested relative path", path: "artifacts/demo.yaml", wantErr: false},
+		{name: "reject absolute path", path: "/tmp/demo.yaml", wantErr: true},
+		{name: "reject traversal path", path: "../demo.yaml", wantErr: true},
+		{name: "reject nested traversal path", path: "subdir/../../../demo.yaml", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := validateOutputPath(tt.path)
+			if tt.wantErr && err == nil {
+				t.Fatalf("expected error for path %q", tt.path)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("did not expect error for path %q, got: %v", tt.path, err)
+			}
+		})
+	}
+}

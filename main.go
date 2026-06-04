@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -50,7 +51,7 @@ func defaultWorkloadConfig() workloadConfig {
 
 func runGenerateManifest(args []string) {
 	cfg := defaultWorkloadConfig()
-	fs := flag.NewFlagSet("generate-manifest", flag.ExitOnError)
+	fs := flag.NewFlagSet("generate-manifest", flag.ContinueOnError)
 	fs.StringVar(&cfg.Name, "name", cfg.Name, "workload name")
 	fs.StringVar(&cfg.Namespace, "namespace", cfg.Namespace, "kubernetes namespace")
 	fs.StringVar(&cfg.Image, "image", cfg.Image, "container image")
@@ -60,10 +61,28 @@ func runGenerateManifest(args []string) {
 	fs.IntVar(&cfg.GPUs, "gpus", cfg.GPUs, "nvidia.com/gpu limits and requests")
 	fs.IntVar(&cfg.Port, "port", cfg.Port, "service and container port")
 	outputPath := fs.String("out", "", "optional output path for YAML")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
 
-	if cfg.Replicas < 1 || cfg.GPUs < 1 || cfg.Port < 1 {
-		fmt.Println("replicas, gpus, and port must be >= 1")
+	if cfg.Replicas < 1 {
+		fmt.Println("replicas must be >= 1")
+		os.Exit(1)
+	}
+	if cfg.GPUs < 1 {
+		fmt.Println("gpus must be >= 1")
+		os.Exit(1)
+	}
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		fmt.Println("port must be between 1 and 65535")
+		os.Exit(1)
+	}
+	if strings.TrimSpace(cfg.CPU) == "" {
+		fmt.Println("cpu must be non-empty")
+		os.Exit(1)
+	}
+	if strings.TrimSpace(cfg.Memory) == "" {
+		fmt.Println("memory must be non-empty")
 		os.Exit(1)
 	}
 
@@ -71,15 +90,41 @@ func runGenerateManifest(args []string) {
 	summary := measurableSummary(cfg)
 
 	if *outputPath != "" {
-		if err := os.WriteFile(*outputPath, []byte(manifest), 0o644); err != nil {
-			fmt.Printf("failed to write manifest to %s: %v\n", *outputPath, err)
+		cleanOutputPath, err := validateOutputPath(*outputPath)
+		if err != nil {
+			fmt.Printf("invalid output path %q: %v\n", *outputPath, err)
 			os.Exit(1)
 		}
-		fmt.Printf("manifest written to %s\n", *outputPath)
+		outputDir := filepath.Dir(cleanOutputPath)
+		if outputDir != "." {
+			if err := os.MkdirAll(outputDir, 0o755); err != nil {
+				fmt.Printf("failed to create output directory %s: %v\n", outputDir, err)
+				os.Exit(1)
+			}
+		}
+		if err := os.WriteFile(cleanOutputPath, []byte(manifest), 0o644); err != nil {
+			fmt.Printf("failed to write manifest to %s: %v\n", cleanOutputPath, err)
+			os.Exit(1)
+		}
+		fmt.Printf("manifest written to %s\n", cleanOutputPath)
+	} else {
+		fmt.Println(manifest)
 	}
-
-	fmt.Println(manifest)
 	fmt.Println(summary)
+}
+
+func validateOutputPath(path string) (string, error) {
+	cleanPath := filepath.Clean(path)
+	if cleanPath == "." || cleanPath == "" {
+		return "", fmt.Errorf("path must specify a file name")
+	}
+	if filepath.IsAbs(cleanPath) {
+		return "", fmt.Errorf("absolute paths are not allowed")
+	}
+	if cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path traversal is not allowed")
+	}
+	return cleanPath, nil
 }
 
 func generateManifest(cfg workloadConfig) string {

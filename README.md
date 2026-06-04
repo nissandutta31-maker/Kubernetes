@@ -11,7 +11,7 @@ A lightweight NVIDIA-focused Kubernetes showcase project.
 ## Run locally
 
 ```bash
-cd /tmp/workspace/nissandutta31-maker/Kubernetes
+cd <project-root>
 go run . generate-manifest
 ```
 
@@ -21,16 +21,20 @@ go run . generate-manifest
 go run . generate-manifest \
   -name nvidia-internship-demo \
   -namespace ai \
-  -image nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0 \
+  -image nvcr.io/nvidia/pytorch:24.03-py3 \
   -replicas 2 \
   -cpu 1000m \
   -memory 2Gi \
   -gpus 1 \
   -port 8080 \
-  -out /tmp/workspace/nissandutta31-maker/Kubernetes/nvidia-dgx-cloud-k8s-demo.yaml
+  -out ./nvidia-dgx-cloud-k8s-demo.yaml
 ```
 
+When `-out` is used, YAML is written to the file and the measurable summary is still printed to stdout.
+
 ## CI-style validation
+
+This repository currently has no `go.mod`, so CI runs with `GO111MODULE=off`.
 
 ```bash
 GO111MODULE=off go build -v ./...

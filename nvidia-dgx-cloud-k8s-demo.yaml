@@ -39,12 +39,3 @@ spec:
       port: 8080
       targetPort: 8080
   type: ClusterIP
-
-=== Showcase Metrics ===
-Replicas: 1
-CPU per pod: 500m
-Memory per pod: 1Gi
-GPU per pod: 1
-Total GPUs requested: 1
-Image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0
-
