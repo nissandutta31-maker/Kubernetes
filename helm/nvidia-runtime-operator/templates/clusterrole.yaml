@@ -1,0 +1,41 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "nvidia-runtime-operator.fullname" . }}-manager
+  labels:
+    {{- include "nvidia-runtime-operator.labels" . | nindent 4 }}
+rules:
+- apiGroups: ["runtime.nvidia.com"]
+  resources: ["runtimepackages"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["runtime.nvidia.com"]
+  resources: ["runtimepackages/status"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: ["runtime.nvidia.com"]
+  resources: ["runtimepackages/finalizers"]
+  verbs: ["update"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "nvidia-runtime-operator.fullname" . }}-manager
+  labels:
+    {{- include "nvidia-runtime-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "nvidia-runtime-operator.fullname" . }}-manager
+subjects:
+- kind: ServiceAccount
+  name: {{ include "nvidia-runtime-operator.serviceAccountName" . }}
+  namespace: {{ .Values.namespace }}

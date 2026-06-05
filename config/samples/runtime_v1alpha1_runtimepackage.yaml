@@ -1,0 +1,36 @@
+---
+# Example: install nvidia-container-toolkit on all H100 nodes.
+apiVersion: runtime.nvidia.com/v1alpha1
+kind: RuntimePackage
+metadata:
+  name: nvidia-container-toolkit
+  namespace: nvidia-system
+spec:
+  packageName: nvidia-container-toolkit
+  version: "1.14.6"
+  targetArchitectures:
+  - H100
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  autoUpgrade: true
+  validationScript: |
+    #!/bin/bash
+    set -e
+    nvidia-smi --query-gpu=name --format=csv,noheader | head -1
+    echo "GPU runtime validation passed"
+---
+# Example: install open-kernel DRA driver on GB200/GB300 nodes (NVLink fabric clusters).
+apiVersion: runtime.nvidia.com/v1alpha1
+kind: RuntimePackage
+metadata:
+  name: nvidia-dra-driver-gb200
+  namespace: nvidia-system
+spec:
+  packageName: nvidia-dra-driver
+  version: "0.7.0"
+  targetArchitectures:
+  - GB200
+  - GB300
+  nodeSelector:
+    nvidia.com/gpu.product: "NVIDIA-GH200-480GB"
+  autoUpgrade: false
