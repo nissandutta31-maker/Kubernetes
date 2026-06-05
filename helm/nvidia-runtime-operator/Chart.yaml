@@ -1,0 +1,20 @@
+apiVersion: v2
+name: nvidia-runtime-operator
+description: Kubernetes operator that manages GPU runtime package lifecycle (container
+  toolkit, DRA drivers, and other accelerated compute components) across NVIDIA GPU
+  nodes.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+- nvidia
+- gpu
+- kubernetes
+- operator
+- runtime
+- dgx
+home: https://github.com/nissandutta31-maker/kubernetes
+sources:
+- https://github.com/nissandutta31-maker/kubernetes
+maintainers:
+- name: nissandutta31-maker

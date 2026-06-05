@@ -1,0 +1,28 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nvidia-runtime-operator-manager
+rules:
+# RuntimePackage resources
+- apiGroups: ["runtime.nvidia.com"]
+  resources: ["runtimepackages"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["runtime.nvidia.com"]
+  resources: ["runtimepackages/status"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: ["runtime.nvidia.com"]
+  resources: ["runtimepackages/finalizers"]
+  verbs: ["update"]
+# DaemonSets managed by the operator
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Read nodes to count targets and validate GPU presence
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+# Events for observability
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]

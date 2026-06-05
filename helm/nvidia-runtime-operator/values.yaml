@@ -1,0 +1,33 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/nissandutta31-maker/nvidia-runtime-operator
+  pullPolicy: IfNotPresent
+  tag: ""  # defaults to Chart.appVersion
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Leader election for HA deployments (set replicaCount > 1 to use).
+leaderElection: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Install CRD as part of the Helm release.
+installCRD: true
+
+# Namespace where the operator is deployed.
+namespace: nvidia-system
