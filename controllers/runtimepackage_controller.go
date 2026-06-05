@@ -270,9 +270,14 @@ func PackageImage(pkg *runtimev1alpha1.RuntimePackage) string {
 }
 
 // setCondition upserts a condition into the slice, matching by Type.
+// LastTransitionTime is preserved when the Status has not changed, per the
+// Kubernetes API conventions: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) {
 	for i, c := range *conditions {
 		if c.Type == cond.Type {
+			if c.Status == cond.Status {
+				cond.LastTransitionTime = c.LastTransitionTime
+			}
 			(*conditions)[i] = cond
 			return
 		}

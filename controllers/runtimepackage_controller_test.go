@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -162,6 +163,39 @@ func TestSetCondition_Upsert(t *testing.T) {
 	}
 	if conditions[0].Status != metav1.ConditionTrue {
 		t.Error("condition was not updated")
+	}
+}
+
+func TestSetCondition_PreservesTransitionTime(t *testing.T) {
+	original := metav1.Time{Time: time.Now().Add(-time.Hour)}
+	conditions := []metav1.Condition{{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             "Installing",
+		LastTransitionTime: original,
+	}}
+
+	// Same Status — LastTransitionTime must be preserved.
+	setCondition(&conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             "StillInstalling",
+		LastTransitionTime: metav1.Now(),
+	})
+	if !conditions[0].LastTransitionTime.Equal(&original) {
+		t.Error("LastTransitionTime should not change when Status is unchanged")
+	}
+
+	// Changed Status — LastTransitionTime must update.
+	newTime := metav1.Now()
+	setCondition(&conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		Reason:             "PackageInstalled",
+		LastTransitionTime: newTime,
+	})
+	if conditions[0].LastTransitionTime.Equal(&original) {
+		t.Error("LastTransitionTime should update when Status changes")
 	}
 }
 
