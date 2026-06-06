@@ -1,3 +1,3 @@
-module github.com/nissandutta/nvidia-dgx-cloud-k8s-demo
+module github.com/nissandutta31-maker/Kubernetes
 
 go 1.22

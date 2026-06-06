@@ -55,7 +55,7 @@ flowchart LR
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/nissandutta/nvidia-dgx-cloud-k8s-demo.git
+git clone https://github.com/nissandutta31-maker/Kubernetes.git
 cd nvidia-dgx-cloud-k8s-demo
 
 # 2. Full demo: cluster → build → deploy → verify
