@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nvidia-runtime-demo
+  labels:
+    name: nvidia-runtime-demo
+    demo: nvidia-dgx-cloud
