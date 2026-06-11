@@ -13,8 +13,10 @@ Single Go HTTP microservice (`app/main.go`) packaged as a Docker image and deplo
 | Go app (local) | `cd app && go run main.go` | Listens on `:8080`; optional `PORT` env var |
 | Docker image | `make build` or `sudo docker build -t nvidia-demo-app:latest .` | Requires Docker daemon |
 | K8s cluster (Kind) | `make kind-up` | See **Kubernetes limitations** below |
+| Load image into Kind | `make load-image` | Required after `make build` before deploy on Kind |
 | Deploy + verify | `make deploy && make verify` | Needs a running cluster |
-| Port-forward | `kubectl port-forward svc/nvidia-demo-svc 8080:80 -n nvidia-runtime-demo` | Makefile `port-forward` target uses wrong service name (`nvidia-demo-app` vs `nvidia-demo-svc`) |
+| Fast local build | `make build-local` | Builds `bin/server` without Docker |
+| Port-forward | `make port-forward` | Forwards `nvidia-demo-svc` to `localhost:8080` |
 
 ### Lint / test / build
 
