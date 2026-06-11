@@ -56,7 +56,7 @@ flowchart LR
 ```bash
 # 1. Clone the repository
 git clone https://github.com/nissandutta31-maker/Kubernetes.git
-cd nvidia-dgx-cloud-k8s-demo
+cd Kubernetes
 
 # 2. Full demo: cluster → build → deploy → verify
 make all
@@ -82,9 +82,11 @@ curl http://localhost:8080/
 | `make help` | List all available targets |
 | `make build` | Build the Go app into a minimal Docker image |
 | `make kind-up` | Create a local Kind cluster |
+| `make kind-load` | Load the built image into the Kind cluster |
 | `make deploy` | Apply namespace, deployment, and service manifests |
 | `make verify` | Run the Python health check to validate pod state |
 | `make port-forward` | Expose the service on `localhost:8080` |
+| `make kind-down` | Delete the local Kind cluster |
 | `make clean` | Tear down all deployed resources |
 
 ---
@@ -92,7 +94,7 @@ curl http://localhost:8080/
 ## Repository Structure
 
 ```
-nvidia-dgx-cloud-k8s-demo/
+Kubernetes/
 ├── app/
 │   ├── go.mod                     # Go module definition
 │   └── main.go                    # HTTP server (port from PORT env var)
