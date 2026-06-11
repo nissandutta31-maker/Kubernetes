@@ -62,8 +62,8 @@ def summarize(pods: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
-def format_output(namespace: str, pods: list[dict[str, Any]]) -> None:
-    """Print a clean, human-readable summary."""
+def format_output(namespace: str, pods: list[dict[str, Any]]) -> bool:
+    """Print a clean, human-readable summary. Returns True when all pods are healthy."""
     divider = "─" * 60
 
     print(f"\n{divider}")
@@ -74,7 +74,7 @@ def format_output(namespace: str, pods: list[dict[str, Any]]) -> None:
     if not pods:
         print("  ⚠️  No pods found in this namespace.")
         print(f"{divider}\n")
-        return
+        return False
 
     summary = summarize(pods)
 
@@ -105,12 +105,15 @@ def format_output(namespace: str, pods: list[dict[str, Any]]) -> None:
     print(f"  {'─' * 42}")
     print(f"  {'Total':<14} {total:>3}")
 
-    if running == total and total > 0:
+    healthy = running == total and total > 0
+
+    if healthy:
         print(f"\n  🎉 All {running} pods are healthy and running!")
     else:
         print(f"\n  📊 {running}/{total} pods are in Running state.")
 
     print(f"{divider}\n")
+    return healthy
 
 
 def main() -> None:
@@ -118,7 +121,8 @@ def main() -> None:
 
     check_kubectl_installed()
     pods = get_pods(namespace)
-    format_output(namespace, pods)
+    if not format_output(namespace, pods):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

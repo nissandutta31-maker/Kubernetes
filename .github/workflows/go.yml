@@ -28,3 +28,6 @@ jobs:
     - name: Vet
       working-directory: ./app
       run: go vet ./...
+
+    - name: Validate Python health check
+      run: python3 -m py_compile automation/health_check.py
