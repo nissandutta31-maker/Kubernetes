@@ -1,4 +1,3 @@
-```
 # Dependencies
 node_modules/
 venv/
@@ -12,6 +11,10 @@ target/
 # Build artifacts
 dist/
 build/
+/app/*
+!app/*.go
+!app/go.mod
+!app/go.sum
 *.pyc
 *.class
 *.o
@@ -69,4 +72,3 @@ htmlcov/
 *.tar.bz2
 *.tar.xz
 *.tar.zst
-```

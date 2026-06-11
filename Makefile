@@ -1,8 +1,10 @@
-.PHONY: help build kind-up deploy verify clean
+.PHONY: help build kind-up kind-down load-image deploy verify port-forward clean all
 
-APP_NAME    := nvidia-demo-app
-NAMESPACE   := nvidia-runtime-demo
-K8S_DIR     := k8s
+APP_NAME     := nvidia-demo-app
+NAMESPACE    := nvidia-runtime-demo
+KIND_CLUSTER := nvidia-demo
+K8S_DIR      := k8s
+IMAGE        := $(APP_NAME):latest
 
 # ── Default target ──────────────────────────────────────────────
 help: ## Show this help message
@@ -12,14 +14,17 @@ help: ## Show this help message
 
 # ── Build ───────────────────────────────────────────────────────
 build: ## Build the Docker image for the Go application
-	docker build -t $(APP_NAME):latest .
+	docker build -t $(IMAGE) .
 
 # ── Cluster ─────────────────────────────────────────────────────
 kind-up: ## Create a local Kubernetes cluster using Kind
-	kind create cluster --name nvidia-demo || echo "Cluster may already exist."
+	kind create cluster --name $(KIND_CLUSTER) || echo "Cluster may already exist."
 
 kind-down: ## Delete the Kind cluster
-	kind delete cluster --name nvidia-demo
+	kind delete cluster --name $(KIND_CLUSTER)
+
+load-image: build ## Load the local Docker image into the Kind cluster
+	kind load docker-image $(IMAGE) --name $(KIND_CLUSTER)
 
 # ── Deploy ──────────────────────────────────────────────────────
 deploy: ## Apply all Kubernetes manifests to the cluster
@@ -27,15 +32,15 @@ deploy: ## Apply all Kubernetes manifests to the cluster
 	kubectl apply -f $(K8S_DIR)/deployment.yaml
 	kubectl apply -f $(K8S_DIR)/service.yaml
 	@echo ""
-	@echo "⏳ Waiting for pods to become ready..."
+	@echo "Waiting for pods to become ready..."
 	kubectl wait --for=condition=ready pod \
 		-l app=$(APP_NAME) \
 		-n $(NAMESPACE) \
-		--timeout=60s || true
+		--timeout=120s
 
 # ── Verify ──────────────────────────────────────────────────────
 verify: ## Run the Python health-check script against the cluster
-	python3 automation/health_check.py
+	python3 automation/health_check.py --namespace $(NAMESPACE)
 
 # ── Port Forward (for local testing) ────────────────────────────
 port-forward: ## Forward the service port to localhost:8080
@@ -46,7 +51,7 @@ clean: ## Remove all deployed resources from the cluster
 	kubectl delete namespace $(NAMESPACE) --ignore-not-found
 
 # ── All-in-one ──────────────────────────────────────────────────
-all: kind-up build deploy verify ## Full demo: cluster → build → deploy → verify
+all: kind-up load-image deploy verify ## Full demo: cluster → build → load → deploy → verify
 	@echo ""
-	@echo "🚀 NVIDIA DGX Cloud Runtime Demo is live!"
-	@echo "   Run 'make port-forward' then visit http://localhost:8080"
+	@echo "NVIDIA DGX Cloud Runtime Demo is live!"
+	@echo "Run 'make port-forward' then visit http://localhost:8080"
