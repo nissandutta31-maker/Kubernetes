@@ -3,9 +3,12 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /build
 
-COPY app/ .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o server main.go
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o server main.go
+# Cache module downloads separately from source changes.
+COPY app/go.mod ./
+RUN go mod download
+
+COPY app/main.go ./
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o server main.go
 
 # ---- Runtime Stage ----
 FROM alpine:3.19

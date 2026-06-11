@@ -1,0 +1,9 @@
+.git
+.github
+.gitignore
+*.md
+AGENTS.md
+k8s/
+automation/
+Makefile
+**/*_test.go

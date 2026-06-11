@@ -12,6 +12,9 @@ target/
 # Build artifacts
 dist/
 build/
+bin/
+app/Kubernetes
+app/server
 *.pyc
 *.class
 *.o
