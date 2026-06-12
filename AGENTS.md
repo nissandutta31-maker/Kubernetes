@@ -35,24 +35,26 @@ The `.cursor/Dockerfile` provides Go 1.22, Docker, kubectl, kind, and Python 3.
 # Build the app image
 make build
 
-# Create a local Kind cluster, deploy, and verify
+# Create a local Kind cluster, build image, load into cluster, deploy, and verify
 make all
 
 # Step by step
 make kind-up
+make load-image   # build + load image into kind (required before deploy)
 make deploy
 make verify
 
 # Expose the service locally inside the VM
-make port-forward
+make port-forward   # forwards svc/nvidia-demo-svc to localhost:8080
 ```
 
 ### Verification
 
-After `make deploy`, run `make verify`. All pods in the `nvidia-runtime-demo` namespace should report `Running`.
+After `make deploy`, run `make verify`. All pods in the `nvidia-runtime-demo` namespace should report `Running`. If pods are missing or not healthy, `make verify` exits with a non-zero status.
 
 ### Notes
 
 - Kind requires Docker. The cloud environment starts the Docker daemon on boot.
 - `make kind-up` is idempotent; it tolerates an existing cluster.
+- `make deploy` automatically builds the image and runs `kind load docker-image` so the cluster can pull `nvidia-demo-app:latest`.
 - The health check script (`automation/health_check.py`) needs a reachable Kubernetes API — run `make kind-up` and `make deploy` first.

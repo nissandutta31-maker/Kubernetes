@@ -9,8 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     make \
     python3 \
-    python3-pip \
     sudo \
+    fuse-overlayfs \
+    iptables \
     && rm -rf /var/lib/apt/lists/*
 
 # Go 1.22
@@ -48,8 +49,6 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && apt-get install -y fuse-overlayfs iptables \
-    && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /etc/docker \
     && printf '%s\n' '{' '  "storage-driver": "fuse-overlayfs"' '}' > /etc/docker/daemon.json
 RUN update-alternatives --set iptables /usr/sbin/iptables-legacy \
