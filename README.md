@@ -8,9 +8,62 @@
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
-## Overview
+## Problem
 
-A production-grade demonstration of running containerized workloads on a Kubernetes runtime — built to showcase the foundational skills required for managing GPU-accelerated infrastructure on **NVIDIA DGX Cloud**. This project packages a Go microservice into a minimal container, deploys it declaratively onto a local Kubernetes cluster via manifests, and validates cluster state with a Python automation script.
+NVIDIA DGX Cloud orchestrates GPU workloads on Kubernetes at scale. Platform engineers need reproducible deploy pipelines, health validation, and GPU scheduling patterns — not just YAML snippets.
+
+## What I Built
+
+- **Go microservice** with `/` and `/health` endpoints, packaged in a multi-stage Alpine container
+- **Declarative K8s stack** — Namespace, 2-replica Deployment (probes + resource limits), ClusterIP Service
+- **Makefile workflow** — `make all` runs Kind → build → image load → deploy → verify in one command
+- **Python automation** — pod phase report plus in-cluster HTTP check against the service
+- **GPU extension** — optional manifest with `nvidia.com/gpu` requests and production notes ([docs/gpu-workloads.md](docs/gpu-workloads.md))
+
+## Proof
+
+| Artifact | Link |
+|---|---|
+| Demo video | `[YOUR_DEMO_VIDEO_URL]` — see [docs/demo-recording.md](docs/demo-recording.md) for script |
+| CI | Go build/vet + manifest dry-run validation on every push |
+| Outreach templates | [docs/outreach-templates.md](docs/outreach-templates.md) |
+| Resume / LinkedIn copy | [docs/profile-materials.md](docs/profile-materials.md) |
+| Cursor + Nemotron NIM setup | [docs/cursor-nemotron-nim-setup.md](docs/cursor-nemotron-nim-setup.md) |
+| Next-cycle apply checklist | [docs/application-checklist.md](docs/application-checklist.md) |
+
+### Demo Verified (expected flow)
+
+```bash
+make all
+# → Kind cluster created, image built & loaded, manifests applied, pods ready, HTTP /health OK
+
+make port-forward   # separate terminal
+curl http://localhost:8080/
+# → Hello from NVIDIA DGX Cloud Runtime Pod!
+
+curl http://localhost:8080/health
+# → OK
+```
+
+Sample `make verify` output:
+
+```
+────────────────────────────────────────────────────────────
+  NVIDIA DGX Cloud — Pod Health Report
+  Namespace: nvidia-runtime-demo
+────────────────────────────────────────────────────────────
+  🎉 All 2 pods are healthy and running!
+
+  HTTP HEALTH
+  ✅ GET http://nvidia-demo-svc/health → OK
+────────────────────────────────────────────────────────────
+```
+
+### Honest Limits
+
+- Runs on **local Kind without GPUs** — the optional GPU deployment stays `Pending` until scheduled on a GPU node (by design)
+- Focus is **platform/runtime automation**, not CUDA kernel development
+- See [docs/gpu-workloads.md](docs/gpu-workloads.md) for production GPU cluster requirements
 
 ---
 
@@ -19,25 +72,15 @@ A production-grade demonstration of running containerized workloads on a Kuberne
 ```mermaid
 flowchart LR
     A[Go Source Code] -->|docker build| B[Docker Container]
-    B -->|kubectl apply| C[K8s Deployment<br/>2 Replicas]
-    C --> D[K8s Pods]
-    D --> E[K8s Service<br/>ClusterIP :80]
-    E -->|port-forward| F[User / Client]
+    B -->|kind load| C[Kind Cluster]
+    C -->|kubectl apply| D[K8s Deployment<br/>2 Replicas]
+    D --> E[K8s Pods]
+    E --> F[K8s Service<br/>ClusterIP :80]
+    F -->|port-forward| G[User / Client]
 
-    G[Python Health Check] -.->|kubectl get pods| C
+    H[Python Health Check] -->|kubectl get pods| D
+    H -->|in-cluster curl| F
 ```
-
----
-
-## Kubernetes Concepts Demonstrated
-
-| Concept | What it does in this project |
-|---|---|
-| **Pods** | Each replica runs inside its own pod — the smallest deployable unit in K8s. Our deployment manages 2 of them. |
-| **Deployments** | Declares the desired state (2 replicas, container image, resource limits). The Kubernetes controller reconciles the actual state to match. |
-| **Services** | Provides a stable network identity (`ClusterIP`) that load-balances traffic across the 2 pods, decoupling the backend from consumers. |
-| **Namespaces** | Isolates our demo resources under `nvidia-runtime-demo`, preventing collisions with other workloads in the cluster. |
-| **Health Probes** | The deployment includes `livenessProbe` and `readinessProbe` — patterns essential for GPU workloads where node health directly impacts training jobs. |
 
 ---
 
@@ -45,7 +88,7 @@ flowchart LR
 
 - [Go](https://go.dev/dl/) 1.22+
 - [Docker](https://docs.docker.com/get-docker/) 24+
-- [Kind](https://kind.sigs.k8s.io/) (or Minikube)
+- [Kind](https://kind.sigs.k8s.io/)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) 1.29+
 - [Python](https://www.python.org/downloads/) 3.10+
 
@@ -54,23 +97,33 @@ flowchart LR
 ## Quickstart
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/nissandutta31-maker/Kubernetes.git
-cd nvidia-dgx-cloud-k8s-demo
+cd Kubernetes
 
-# 2. Full demo: cluster → build → deploy → verify
+# Full demo: cluster → build → load image → deploy → verify
 make all
 
-# Or step by step:
-make kind-up        # Spin up a local K8s cluster
-make build          # Build the Docker image
-make deploy         # Apply all K8s manifests
-make verify         # Run the Python health check
-
-# 3. Test the app locally
-make port-forward   # Forward service to localhost:8080
+# Test locally
+make port-forward   # separate terminal
 curl http://localhost:8080/
-# → "Hello from NVIDIA DGX Cloud Runtime Pod!"
+curl http://localhost:8080/health
+```
+
+Or step by step:
+
+```bash
+make kind-up
+make build
+make load-image
+make deploy
+make verify
+```
+
+Optional GPU manifest (Pending on Kind without GPUs):
+
+```bash
+kubectl apply -f k8s/gpu-deployment.yaml
+kubectl get pods -n nvidia-runtime-demo -l app=nvidia-gpu-demo
 ```
 
 ---
@@ -81,42 +134,51 @@ curl http://localhost:8080/
 |---|---|
 | `make help` | List all available targets |
 | `make build` | Build the Go app into a minimal Docker image |
+| `make load-image` | Load the local image into the Kind cluster |
 | `make kind-up` | Create a local Kind cluster |
 | `make deploy` | Apply namespace, deployment, and service manifests |
-| `make verify` | Run the Python health check to validate pod state |
+| `make verify` | Run Python health check (pods + HTTP `/health`) |
+| `make validate-manifests` | Dry-run validate all K8s YAML |
 | `make port-forward` | Expose the service on `localhost:8080` |
-| `make clean` | Tear down all deployed resources |
+| `make clean` | Remove all deployed resources |
+| `make all` | Full demo pipeline |
 
 ---
 
 ## Repository Structure
 
 ```
-nvidia-dgx-cloud-k8s-demo/
 ├── app/
-│   ├── go.mod                     # Go module definition
-│   └── main.go                    # HTTP server (port from PORT env var)
+│   ├── go.mod
+│   └── main.go
 ├── automation/
-│   └── health_check.py            # Python script: kubectl → JSON parse → report
+│   └── health_check.py
+├── docs/
+│   ├── application-checklist.md
+│   ├── demo-recording.md
+│   ├── gpu-workloads.md
+│   ├── outreach-templates.md
+│   └── profile-materials.md
 ├── k8s/
-│   ├── namespace.yaml             # Creates nvidia-runtime-demo namespace
-│   ├── deployment.yaml            # 2 replicas, resource limits, health probes
-│   └── service.yaml               # ClusterIP on port 80 → target port 8080
-├── Dockerfile                     # Multi-stage: build in golang, run on alpine
-├── Makefile                       # DevEx automation (build, deploy, verify, clean)
-└── README.md                      # You are here
+│   ├── namespace.yaml
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── gpu-deployment.yaml
+├── Dockerfile
+├── Makefile
+└── README.md
 ```
 
 ---
 
 ## Why This Matters for DGX Cloud
 
-NVIDIA DGX Cloud runs large-scale GPU clusters orchestrated by Kubernetes. The skills demonstrated in this project map directly to the DGX Cloud runtime ecosystem:
+NVIDIA DGX Cloud runs large-scale GPU clusters orchestrated by Kubernetes. This project demonstrates the operational patterns those teams use daily:
 
-- **Containerization** — Every DGX workload is containerized. This project's multi-stage Dockerfile mirrors the image-building patterns used in production GPU pipelines.
-- **Declarative Infrastructure** — Kubernetes manifests (YAML) are the universal language for describing DGX Cloud deployments, from single-node inference to multi-node distributed training.
-- **Automation** — Python scripting against the Kubernetes API enables the kind of cluster-state validation and health monitoring that keeps DGX Cloud customer workloads running reliably.
-- **DevEx** — A clean Makefile interface (build → deploy → verify → clean) reflects the operator experience that DGX Cloud engineers build for internal teams and customers.
+- **Containerization** — multi-stage Docker build, non-root runtime user
+- **Declarative infrastructure** — version-controlled manifests with probes and resource limits
+- **Automation** — scripted cluster validation including HTTP health through the service
+- **GPU scheduling** — documented manifest for `nvidia.com/gpu`, node selectors, and tolerations
 
 ---
 

@@ -28,3 +28,23 @@ jobs:
     - name: Vet
       working-directory: ./app
       run: go vet ./...
+
+  validate-manifests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Validate Kubernetes manifests
+      run: |
+        kubectl apply --dry-run=client -f k8s/namespace.yaml
+        kubectl apply --dry-run=client -f k8s/deployment.yaml
+        kubectl apply --dry-run=client -f k8s/service.yaml
+        kubectl apply --dry-run=client -f k8s/gpu-deployment.yaml
+
+  health-check-script:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Syntax check health_check.py
+      run: python3 -m py_compile automation/health_check.py
