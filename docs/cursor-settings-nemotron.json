@@ -1,0 +1,27 @@
+{
+  "_comment": "Merge into Cursor User settings.json (Ctrl/Cmd+Shift+P -> Open User Settings JSON). Replace nvapi-YOUR_KEY. Prefer proxy setup in docs/cursor-nemotron-nim-setup.md for max reasoning.",
+  "cursor.chat.contextLength": "long",
+  "cursor.aiModels": [
+    {
+      "name": "nemotron-3-ultra-nim",
+      "provider": "openai-compatible",
+      "apiKey": "nvapi-YOUR_KEY",
+      "baseUrl": "https://integrate.api.nvidia.com/v1",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "contextLength": 1048576,
+      "maxTokens": 32768,
+      "temperature": 1.0
+    },
+    {
+      "name": "nemotron-3-ultra-proxy",
+      "provider": "openai-compatible",
+      "apiKey": "unused",
+      "baseUrl": "http://127.0.0.1:8765/v1",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "contextLength": 1048576,
+      "maxTokens": 32768,
+      "temperature": 1.0
+    }
+  ],
+  "cursor.defaultModel": "nemotron-3-ultra-proxy"
+}

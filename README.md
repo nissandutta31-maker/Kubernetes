@@ -28,6 +28,7 @@ NVIDIA DGX Cloud orchestrates GPU workloads on Kubernetes at scale. Platform eng
 | CI | Go build/vet + manifest dry-run validation on every push |
 | Outreach templates | [docs/outreach-templates.md](docs/outreach-templates.md) |
 | Resume / LinkedIn copy | [docs/profile-materials.md](docs/profile-materials.md) |
+| Cursor + Nemotron NIM setup | [docs/cursor-nemotron-nim-setup.md](docs/cursor-nemotron-nim-setup.md) |
 | Next-cycle apply checklist | [docs/application-checklist.md](docs/application-checklist.md) |
 
 ### Demo Verified (expected flow)
