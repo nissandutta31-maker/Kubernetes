@@ -3,23 +3,30 @@
 DGX Cloud Runtime Health Check
 
 Queries the Kubernetes API for all pods in the nvidia-runtime-demo
-namespace and reports their running status. Designed to validate
-cluster state after a deployment.
+namespace, reports their running status, and validates HTTP /health
+via the ClusterIP service from an in-cluster curl pod.
 """
 
 import json
 import subprocess
 import sys
+import time
+import uuid
 from typing import Any
 
+NAMESPACE = "nvidia-runtime-demo"
+APP_LABEL = "app=nvidia-demo-app"
+SERVICE_NAME = "nvidia-demo-svc"
+HEALTH_PATH = "/health"
 
-def run_kubectl(args: list[str]) -> subprocess.CompletedProcess:
+
+def run_kubectl(args: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
     """Execute a kubectl command and return the CompletedProcess."""
     return subprocess.run(
         ["kubectl"] + args,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=timeout,
     )
 
 
@@ -62,23 +69,72 @@ def summarize(pods: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
-def format_output(namespace: str, pods: list[dict[str, Any]]) -> None:
-    """Print a clean, human-readable summary."""
+def check_http_health(namespace: str, service: str, path: str = HEALTH_PATH) -> bool:
+    """Run an in-cluster curl pod against the service health endpoint."""
+    pod_name = f"health-curl-{uuid.uuid4().hex[:8]}"
+    url = f"http://{service}{path}"
+
+    create = run_kubectl(
+        [
+            "run",
+            pod_name,
+            "-n",
+            namespace,
+            "--restart=Never",
+            "--image=curlimages/curl:8.5.0",
+            "--command",
+            "--",
+            "curl",
+            "-sf",
+            url,
+        ],
+        timeout=30,
+    )
+    if create.returncode != 0:
+        print(f"  ❌ Failed to start health check pod: {create.stderr.strip()}")
+        run_kubectl(["delete", "pod", pod_name, "-n", namespace, "--ignore-not-found"])
+        return False
+
+    for _ in range(30):
+        phase_result = run_kubectl(
+            ["get", "pod", pod_name, "-n", namespace, "-o", "jsonpath={.status.phase}"]
+        )
+        phase = phase_result.stdout.strip()
+        if phase == "Succeeded":
+            run_kubectl(["delete", "pod", pod_name, "-n", namespace, "--ignore-not-found"])
+            return True
+        if phase in ("Failed", "Unknown") and phase_result.returncode == 0:
+            logs = run_kubectl(["logs", pod_name, "-n", namespace])
+            if logs.stdout.strip():
+                print(f"  curl output: {logs.stdout.strip()}")
+            if logs.stderr.strip():
+                print(f"  curl error: {logs.stderr.strip()}")
+            run_kubectl(["delete", "pod", pod_name, "-n", namespace, "--ignore-not-found"])
+            return False
+        time.sleep(1)
+
+    run_kubectl(["delete", "pod", pod_name, "-n", namespace, "--ignore-not-found"])
+    print("  ❌ Timed out waiting for in-cluster HTTP health check.")
+    return False
+
+
+def format_output(namespace: str, pods: list[dict[str, Any]], http_ok: bool | None) -> bool:
+    """Print a clean, human-readable summary. Returns True if all checks passed."""
     divider = "─" * 60
+    all_ok = True
 
     print(f"\n{divider}")
-    print(f"  NVIDIA DGX Cloud — Pod Health Report")
+    print("  NVIDIA DGX Cloud — Pod Health Report")
     print(f"  Namespace: {namespace}")
     print(f"{divider}")
 
     if not pods:
         print("  ⚠️  No pods found in this namespace.")
         print(f"{divider}\n")
-        return
+        return False
 
     summary = summarize(pods)
 
-    # Print per-pod details
     print(f"  {'POD NAME':<40} {'PHASE':<12} {'NODE'}")
     print(f"  {'─'*38:<40} {'─'*10:<12} {'─'*20}")
 
@@ -90,9 +146,8 @@ def format_output(namespace: str, pods: list[dict[str, Any]]) -> None:
         icon = "✅" if phase == "Running" else "⏳"
         print(f"  {icon} {name:<38} {phase:<12} {node}")
 
-    # Print summary counts
     print(f"\n{divider}")
-    print(f"  SUMMARY")
+    print("  SUMMARY")
     print(f"{divider}")
 
     total = len(pods)
@@ -109,16 +164,36 @@ def format_output(namespace: str, pods: list[dict[str, Any]]) -> None:
         print(f"\n  🎉 All {running} pods are healthy and running!")
     else:
         print(f"\n  📊 {running}/{total} pods are in Running state.")
+        all_ok = False
+
+    print(f"\n{divider}")
+    print("  HTTP HEALTH")
+    print(f"{divider}")
+
+    if http_ok is None:
+        print("  ⏭️  Skipped (no Running pods for app deployment)")
+        all_ok = False
+    elif http_ok:
+        print(f"  ✅ GET http://{SERVICE_NAME}{HEALTH_PATH} → OK")
+    else:
+        print(f"  ❌ GET http://{SERVICE_NAME}{HEALTH_PATH} failed")
+        all_ok = False
 
     print(f"{divider}\n")
+    return all_ok
 
 
 def main() -> None:
-    namespace = "nvidia-runtime-demo"
-
     check_kubectl_installed()
-    pods = get_pods(namespace)
-    format_output(namespace, pods)
+    pods = [p for p in get_pods(NAMESPACE) if p.get("metadata", {}).get("labels", {}).get("app") == "nvidia-demo-app"]
+
+    http_ok: bool | None = None
+    if pods and all(p.get("status", {}).get("phase") == "Running" for p in pods):
+        http_ok = check_http_health(NAMESPACE, SERVICE_NAME)
+
+    all_ok = format_output(NAMESPACE, pods, http_ok)
+    if not all_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

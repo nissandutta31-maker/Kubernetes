@@ -1,0 +1,37 @@
+# Optional GPU workload manifest for DGX Cloud-style clusters.
+# Requires a node with the NVIDIA device plugin and nvidia.com/gpu allocatable.
+# On local Kind clusters this pod will stay Pending — see docs/gpu-workloads.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nvidia-gpu-demo
+  namespace: nvidia-runtime-demo
+  labels:
+    app: nvidia-gpu-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nvidia-gpu-demo
+  template:
+    metadata:
+      labels:
+        app: nvidia-gpu-demo
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: gpu-sanity
+          image: nvidia/cuda:12.3.1-base-ubuntu22.04
+          command: ["bash", "-c", "nvidia-smi && sleep 3600"]
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "500m"
+              memory: "512Mi"
