@@ -52,11 +52,16 @@ When you use **Override OpenAI Base URL**, Cursor often sends plain chat complet
 
 ### Recommended workaround: local proxy (max reasoning)
 
-Use the included proxy so every request gets max reasoning injected automatically:
-
 ```bash
 export NVIDIA_API_KEY="nvapi-YOUR_KEY"
-python3 tools/nim_cursor_proxy.py
+make nim-verify   # optional: test key + max-reasoning call
+make nim-proxy    # start proxy (keep running)
+```
+
+Or run the setup helper:
+
+```bash
+make cursor-setup
 ```
 
 Then in Cursor **Models**:

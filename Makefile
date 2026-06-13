@@ -1,4 +1,4 @@
-.PHONY: help build load-image kind-up deploy verify validate-manifests clean port-forward all
+.PHONY: help build load-image kind-up deploy verify validate-manifests clean port-forward all nim-verify nim-proxy cursor-setup
 
 APP_NAME      := nvidia-demo-app
 SVC_NAME      := nvidia-demo-svc
@@ -61,3 +61,13 @@ all: kind-up build load-image deploy verify ## Full demo: cluster → build → 
 	@echo ""
 	@echo "🚀 NVIDIA DGX Cloud Runtime Demo is live!"
 	@echo "   Run 'make port-forward' then visit http://localhost:8080"
+
+# ── Nemotron / Cursor ───────────────────────────────────────────
+nim-verify: ## Verify NVIDIA NIM API key and Nemotron max-reasoning call
+	python3 tools/verify_nim_api.py
+
+nim-proxy: ## Start local proxy for Cursor (max reasoning -> NIM API)
+	python3 tools/nim_cursor_proxy.py
+
+cursor-setup: ## Print Cursor + Nemotron setup steps (and verify key if set)
+	bash scripts/setup-cursor-nemotron.sh

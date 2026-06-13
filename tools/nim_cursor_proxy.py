@@ -7,6 +7,8 @@ Injects Nemotron 3 Ultra max-reasoning fields on every chat completion:
   - chat_template_kwargs.force_nonempty_content = true  (Agent/tools)
   - reasoning_budget = -1  (no thinking token cap)
 
+Supports streaming (SSE) for Cursor chat.
+
 Usage:
   export NVIDIA_API_KEY=nvapi-...
   python3 tools/nim_cursor_proxy.py
@@ -33,14 +35,6 @@ UPSTREAM_BASE = os.environ.get(
 ).rstrip("/")
 UPSTREAM_KEY = os.environ.get("NVIDIA_API_KEY", "")
 
-MAX_REASONING_BODY = {
-    "chat_template_kwargs": {
-        "enable_thinking": True,
-        "force_nonempty_content": True,
-    },
-    "reasoning_budget": -1,
-}
-
 
 def merge_reasoning(payload: dict) -> dict:
     merged = dict(payload)
@@ -51,39 +45,53 @@ def merge_reasoning(payload: dict) -> dict:
     extra["chat_template_kwargs"] = chat_kwargs
     extra["reasoning_budget"] = -1
     merged["extra_body"] = extra
-    # Also set top-level fields NIM accepts directly.
     merged["chat_template_kwargs"] = chat_kwargs
     merged["reasoning_budget"] = -1
     return merged
 
 
-def forward(method: str, path: str, body: bytes | None, headers: dict[str, str]) -> tuple[int, bytes, dict[str, str]]:
-    if not UPSTREAM_KEY:
-        return 500, b'{"error":{"message":"NVIDIA_API_KEY not set"}}', {"Content-Type": "application/json"}
+def upstream_url(path: str) -> str:
+    """Join upstream base with request path, avoiding /v1/v1 duplication."""
+    if not path.startswith("/"):
+        path = "/" + path
+    if path.startswith("/v1/"):
+        path = path[3:]
+    elif path == "/v1":
+        path = "/"
+    return f"{UPSTREAM_BASE}{path}"
 
-    url = f"{UPSTREAM_BASE}{path}"
-    req_headers = {
-        "Authorization": f"Bearer {UPSTREAM_KEY}",
-        "Content-Type": headers.get("Content-Type", "application/json"),
-    }
+
+def build_upstream_request(
+    method: str, path: str, body: bytes | None, headers: dict[str, str]
+) -> tuple[urllib.request.Request, bool]:
+    if not UPSTREAM_KEY:
+        raise RuntimeError("NVIDIA_API_KEY not set")
 
     payload = None
+    streaming = False
     if body:
         try:
             payload = json.loads(body.decode("utf-8"))
         except json.JSONDecodeError:
             payload = None
 
-    if payload is not None and path.endswith("/chat/completions"):
+    if payload is not None and "/chat/completions" in path:
         payload = merge_reasoning(payload)
+        streaming = bool(payload.get("stream"))
         body = json.dumps(payload).encode("utf-8")
 
-    request = urllib.request.Request(url, data=body, method=method, headers=req_headers)
-    try:
-        with urllib.request.urlopen(request, timeout=300) as resp:
-            return resp.status, resp.read(), dict(resp.headers)
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read(), dict(exc.headers)
+    req_headers = {
+        "Authorization": f"Bearer {UPSTREAM_KEY}",
+        "Content-Type": headers.get("Content-Type", "application/json"),
+        "Accept": headers.get("Accept", "application/json"),
+    }
+    if streaming:
+        req_headers["Accept"] = "text/event-stream"
+
+    request = urllib.request.Request(
+        upstream_url(path), data=body, method=method, headers=req_headers
+    )
+    return request, streaming
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -92,23 +100,70 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
-    def _handle(self) -> None:
+    def _read_body(self) -> bytes | None:
         length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length) if length else None
-        status, resp_body, resp_headers = forward(self.command, self.path, body, dict(self.headers))
+        return self.rfile.read(length) if length else None
 
+    def _send_error_json(self, status: int, message: str) -> None:
+        body = json.dumps({"error": {"message": message}}).encode("utf-8")
         self.send_response(status)
-        content_type = resp_headers.get("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _proxy(self) -> None:
+        body = self._read_body()
+        try:
+            request, streaming = build_upstream_request(
+                self.command, self.path, body, dict(self.headers)
+            )
+        except RuntimeError as exc:
+            self._send_error_json(500, str(exc))
+            return
+
+        try:
+            upstream = urllib.request.urlopen(request, timeout=600)
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read()
+            self.send_response(exc.code)
+            content_type = exc.headers.get("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(err_body)))
+            self.end_headers()
+            self.wfile.write(err_body)
+            return
+
+        if streaming:
+            self.send_response(upstream.status)
+            content_type = upstream.headers.get("Content-Type", "text/event-stream")
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            while True:
+                chunk = upstream.read(4096)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            upstream.close()
+            return
+
+        resp_body = upstream.read()
+        upstream.close()
+        self.send_response(upstream.status)
+        content_type = upstream.headers.get("Content-Type", "application/json")
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(resp_body)))
         self.end_headers()
         self.wfile.write(resp_body)
 
     def do_GET(self) -> None:
-        self._handle()
+        self._proxy()
 
     def do_POST(self) -> None:
-        self._handle()
+        self._proxy()
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -117,12 +172,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     if not UPSTREAM_KEY:
-        sys.exit("Set NVIDIA_API_KEY before starting the proxy.")
+        sys.exit(
+            "Set NVIDIA_API_KEY before starting the proxy.\n"
+            "  export NVIDIA_API_KEY=nvapi-...\n"
+            "  make nim-proxy"
+        )
 
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
-    print(f"NIM Cursor proxy listening on http://{LISTEN_HOST}:{LISTEN_PORT}/v1")
-    print(f"Upstream: {UPSTREAM_BASE}")
-    print("Injecting enable_thinking=true, force_nonempty_content=true, reasoning_budget=-1")
+    print(f"NIM Cursor proxy: http://{LISTEN_HOST}:{LISTEN_PORT}/v1")
+    print(f"Upstream:         {UPSTREAM_BASE}")
+    print("Reasoning:        enable_thinking=true, reasoning_budget=-1, force_nonempty_content=true")
+    print("Cursor base URL:  http://127.0.0.1:8765/v1")
+    print("Cursor model:     nvidia/nemotron-3-ultra-550b-a55b")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
