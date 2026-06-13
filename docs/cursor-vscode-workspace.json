@@ -1,0 +1,4 @@
+{
+  "_comment": "Optional: copy to .vscode/settings.json in this repo (workspace-level). User-level config: docs/cursor-settings-nemotron.json",
+  "cursor.chat.contextLength": "long"
+}
