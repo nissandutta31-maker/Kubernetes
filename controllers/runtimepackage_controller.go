@@ -80,39 +80,90 @@ func (r *RuntimePackageReconciler) createDaemonSet(ctx context.Context, pkg *run
 	if err := r.Create(ctx, newDS); err != nil {
 		return ctrl.Result{}, fmt.Errorf("creating DaemonSet: %w", err)
 	}
-	return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseInstalling, 0, totalNodes,
+	// With no matching nodes yet, the package is Pending rather than Installing —
+	// there is nothing to install until target nodes join.
+	if totalNodes == 0 {
+		return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhasePending, "", 0, 0,
+			"waiting for nodes matching the node selector")
+	}
+	return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseInstalling, "", 0, totalNodes,
 		fmt.Sprintf("installing %s v%s", pkg.Spec.PackageName, pkg.Spec.Version))
 }
 
 func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runtimev1alpha1.RuntimePackage, ds *appsv1.DaemonSet, totalNodes int32) (ctrl.Result, error) {
-	wantImage := PackageImage(pkg)
-	if len(ds.Spec.Template.Spec.Containers) > 0 && ds.Spec.Template.Spec.Containers[0].Image != wantImage {
-		log.FromContext(ctx).Info("upgrading package", "image", wantImage)
-		ds.Spec.Template.Spec.Containers[0].Image = wantImage
-		if err := r.Update(ctx, ds); err != nil {
-			return ctrl.Result{}, fmt.Errorf("updating DaemonSet for upgrade: %w", err)
-		}
-		return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseUpgrading, ds.Status.NumberReady, totalNodes,
-			fmt.Sprintf("upgrading to %s v%s", pkg.Spec.PackageName, pkg.Spec.Version))
+	if len(ds.Spec.Template.Spec.Containers) == 0 {
+		return ctrl.Result{}, fmt.Errorf("installer DaemonSet %q has no containers", ds.Name)
 	}
 
+	desiredDS := buildDaemonSet(pkg)
+	desiredC := desiredDS.Spec.Template.Spec.Containers[0]
+	currentC := ds.Spec.Template.Spec.Containers[0]
+
+	// The version actually deployed is whatever the running DaemonSet's pods carry,
+	// not what the spec currently asks for. Reading it from the pod template (rather
+	// than assuming spec.Version) keeps status honest when an upgrade is gated or the
+	// installer image is pinned via spec.installerImage.
+	deployedVersion := envValue(currentC.Env, "PACKAGE_VERSION")
+	versionChanged := deployedVersion != pkg.Spec.Version
+
+	// Detect drift across every field we manage — image, env (carries the version and
+	// validation script), and node targeting — not just the image.
+	drift := currentC.Image != desiredC.Image ||
+		!equalEnv(currentC.Env, desiredC.Env) ||
+		!equalStringMap(ds.Spec.Template.Spec.NodeSelector, desiredDS.Spec.Template.Spec.NodeSelector)
+
+	// Roll the DaemonSet only when there is drift AND either it is not a version change
+	// or auto-upgrade is enabled. This honors spec.autoUpgrade=false (no surprise rolls).
+	if drift && (!versionChanged || pkg.Spec.AutoUpgrade) {
+		log.FromContext(ctx).Info("rolling installer DaemonSet", "image", desiredC.Image, "version", pkg.Spec.Version)
+		ds.Spec.Template.Spec.Containers[0].Image = desiredC.Image
+		ds.Spec.Template.Spec.Containers[0].Env = desiredC.Env
+		ds.Spec.Template.Spec.Containers[0].Args = desiredC.Args
+		ds.Spec.Template.Spec.NodeSelector = desiredDS.Spec.Template.Spec.NodeSelector
+		if err := r.Update(ctx, ds); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating DaemonSet: %w", err)
+		}
+		// Leave InstalledVersion untouched (empty) until the new pods are confirmed
+		// ready on a later reconcile — the old version is still what's running.
+		return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseUpgrading, "", ds.Status.NumberReady, totalNodes,
+			fmt.Sprintf("rolling out %s v%s", pkg.Spec.PackageName, pkg.Spec.Version))
+	}
+
+	// No roll: report readiness for the version currently deployed.
 	readyNodes := ds.Status.NumberReady
 	desired := ds.Status.DesiredNumberScheduled
-	phase := runtimev1alpha1.PackagePhaseInstalling
-	message := fmt.Sprintf("waiting for nodes: %d/%d ready", readyNodes, desired)
 
-	if desired > 0 && readyNodes == desired {
+	var phase runtimev1alpha1.PackagePhase
+	var message, installedVersion string
+	switch {
+	case totalNodes == 0:
+		phase = runtimev1alpha1.PackagePhasePending
+		message = "waiting for nodes matching the node selector"
+	case desired > 0 && readyNodes == desired:
 		phase = runtimev1alpha1.PackagePhaseReady
-		message = fmt.Sprintf("%s v%s installed on %d node(s)", pkg.Spec.PackageName, pkg.Spec.Version, readyNodes)
+		installedVersion = deployedVersion
+		message = fmt.Sprintf("%s v%s installed on %d node(s)", pkg.Spec.PackageName, deployedVersion, readyNodes)
+	default:
+		phase = runtimev1alpha1.PackagePhaseInstalling
+		message = fmt.Sprintf("waiting for nodes: %d/%d ready", readyNodes, desired)
 	}
 
-	return r.patchStatus(ctx, pkg, phase, readyNodes, totalNodes, message)
+	// Surface a gated upgrade so it is not silently ignored.
+	if versionChanged && !pkg.Spec.AutoUpgrade {
+		message += fmt.Sprintf("; upgrade to v%s available (autoUpgrade disabled)", pkg.Spec.Version)
+	}
+
+	return r.patchStatus(ctx, pkg, phase, installedVersion, readyNodes, totalNodes, message)
 }
 
+// patchStatus writes the package status. installedVersion is only applied when
+// non-empty (i.e. when readiness at a concrete version has been confirmed), so a
+// rollout in progress does not prematurely advance the reported installed version.
 func (r *RuntimePackageReconciler) patchStatus(
 	ctx context.Context,
 	pkg *runtimev1alpha1.RuntimePackage,
 	phase runtimev1alpha1.PackagePhase,
+	installedVersion string,
 	readyNodes, totalNodes int32,
 	message string,
 ) (ctrl.Result, error) {
@@ -122,8 +173,8 @@ func (r *RuntimePackageReconciler) patchStatus(
 	pkg.Status.TotalNodes = totalNodes
 	pkg.Status.LastUpdateTime = &now
 
-	if phase == runtimev1alpha1.PackagePhaseReady {
-		pkg.Status.InstalledVersion = pkg.Spec.Version
+	if installedVersion != "" {
+		pkg.Status.InstalledVersion = installedVersion
 	}
 
 	condStatus := metav1.ConditionFalse
@@ -146,6 +197,9 @@ func (r *RuntimePackageReconciler) patchStatus(
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
 	}
 
+	// Ready is terminal; every other phase requeues. Pending in particular requeues
+	// so the operator notices when matching nodes join later (it watches its own
+	// DaemonSets, not Node objects).
 	if phase == runtimev1alpha1.PackagePhaseReady {
 		return ctrl.Result{}, nil
 	}
@@ -191,6 +245,16 @@ func buildDaemonSet(pkg *runtimev1alpha1.RuntimePackage) *appsv1.DaemonSet {
 	hostRootType := corev1.HostPathDirectory
 	hostRunType := corev1.HostPathDirectoryOrCreate
 
+	env := []corev1.EnvVar{
+		{Name: "PACKAGE_NAME", Value: pkg.Spec.PackageName},
+		{Name: "PACKAGE_VERSION", Value: pkg.Spec.Version},
+	}
+	// The optional post-install validation script (e.g. an nvidia-smi smoke test)
+	// is passed in as an env var and executed by the installer command below.
+	if pkg.Spec.ValidationScript != "" {
+		env = append(env, corev1.EnvVar{Name: "VALIDATION_SCRIPT", Value: pkg.Spec.ValidationScript})
+	}
+
 	return &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      DaemonSetName(pkg),
@@ -217,19 +281,20 @@ func buildDaemonSet(pkg *runtimev1alpha1.RuntimePackage) *appsv1.DaemonSet {
 							Image:           PackageImage(pkg),
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Command:         []string{"/bin/sh", "-c"},
-							// Run the package's install script if the image provides
-							// one, then hold the pod open as a per-node readiness
-							// sentinel. The script-optional form keeps the DaemonSet
+							// Run the package's install script if the image provides one,
+							// then the optional validation script, then hold the pod open
+							// as a per-node readiness sentinel. A failure in either step
+							// exits non-zero so the pod is NOT reported Ready (the kubelet
+							// restarts it). The script-optional form keeps the DaemonSet
 							// functional with stand-in images during local testing.
 							Args: []string{
-								`if command -v install.sh >/dev/null 2>&1; then install.sh; fi; ` +
+								`set -e; ` +
+									`if command -v install.sh >/dev/null 2>&1; then install.sh; fi; ` +
+									`if [ -n "$VALIDATION_SCRIPT" ]; then printf '%s\n' "$VALIDATION_SCRIPT" | sh; fi; ` +
 									`echo "[$PACKAGE_NAME $PACKAGE_VERSION] runtime package ready on $(hostname)"; ` +
-									`sleep infinity`,
+									`exec sleep infinity`,
 							},
-							Env: []corev1.EnvVar{
-								{Name: "PACKAGE_NAME", Value: pkg.Spec.PackageName},
-								{Name: "PACKAGE_VERSION", Value: pkg.Spec.Version},
-							},
+							Env:             env,
 							SecurityContext: &corev1.SecurityContext{Privileged: &privileged},
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
@@ -283,6 +348,47 @@ func PackageImage(pkg *runtimev1alpha1.RuntimePackage) string {
 		return pkg.Spec.InstallerImage
 	}
 	return fmt.Sprintf("nvcr.io/nvidia/k8s/%s-installer:%s", pkg.Spec.PackageName, pkg.Spec.Version)
+}
+
+// envValue returns the value of the named environment variable, or "" if absent.
+func envValue(env []corev1.EnvVar, name string) string {
+	for _, e := range env {
+		if e.Name == name {
+			return e.Value
+		}
+	}
+	return ""
+}
+
+// equalEnv reports whether two env-var slices hold the same name/value pairs,
+// independent of ordering.
+func equalEnv(a, b []corev1.EnvVar) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	am := make(map[string]string, len(a))
+	for _, e := range a {
+		am[e.Name] = e.Value
+	}
+	for _, e := range b {
+		if v, ok := am[e.Name]; !ok || v != e.Value {
+			return false
+		}
+	}
+	return true
+}
+
+// equalStringMap reports whether two string maps are equal (nil == empty).
+func equalStringMap(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
 }
 
 // setCondition upserts a condition into the slice, matching by Type.

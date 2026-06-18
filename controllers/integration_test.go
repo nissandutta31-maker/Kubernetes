@@ -100,6 +100,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 			Version:             "1.14.6",
 			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchGB200},
 			NodeSelector:        map[string]string{"nvidia.com/gpu.present": "true"},
+			AutoUpgrade:         true,
 		},
 	}
 	if err := k8sClient.Create(ctx, pkg); err != nil {
@@ -188,9 +189,32 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	if pkgAfter.Status.Phase != runtimev1alpha1.PackagePhaseUpgrading {
 		t.Fatalf("phase after upgrade: want Upgrading got %q", pkgAfter.Status.Phase)
 	}
-	t.Logf("✓ reconcile #3: version bump rolled DaemonSet image to %q, phase=Upgrading", wantUpgraded)
+	// InstalledVersion must NOT jump to 1.15.0 until the new pods are confirmed ready.
+	if pkgAfter.Status.InstalledVersion != "1.14.6" {
+		t.Fatalf("InstalledVersion advanced prematurely during rollout: got %q want 1.14.6", pkgAfter.Status.InstalledVersion)
+	}
+	t.Logf("✓ reconcile #3: rolled DaemonSet to %q, phase=Upgrading, installedVersion still 1.14.6", wantUpgraded)
 
-	t.Log("PASS — full install → ready → upgrade lifecycle verified against a real kube-apiserver")
+	// --- Simulate the upgraded pods becoming ready, then reconcile to completion ---
+	if err := k8sClient.Get(ctx, dsKey, ds); err != nil {
+		t.Fatalf("get DaemonSet: %v", err)
+	}
+	ds.Status.DesiredNumberScheduled = 2
+	ds.Status.NumberReady = 2
+	ds.Status.NumberAvailable = 2
+	if err := k8sClient.Status().Update(ctx, ds); err != nil {
+		t.Fatalf("simulate upgraded readiness: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile #4: %v", err)
+	}
+	final := mustGet(t, ctx, pkg.Name, ns)
+	if final.Status.Phase != runtimev1alpha1.PackagePhaseReady || final.Status.InstalledVersion != "1.15.0" {
+		t.Fatalf("after upgrade completion: want Ready/1.15.0 got %s/%s", final.Status.Phase, final.Status.InstalledVersion)
+	}
+	t.Logf("✓ reconcile #4: upgrade complete, phase=Ready installedVersion=1.15.0")
+
+	t.Log("PASS — full install → ready → gated upgrade → ready lifecycle verified against a real kube-apiserver")
 }
 
 // TestIntegration_CRDValidation proves the kubebuilder validation markers in the

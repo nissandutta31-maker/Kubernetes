@@ -26,8 +26,9 @@ resources:
     cpu: 500m
     memory: 256Mi
 
-# Install CRD as part of the Helm release.
-installCRD: true
+# The RuntimePackage CRD ships in the chart's crds/ directory, which Helm
+# installs automatically on `helm install`. (Helm does not upgrade CRDs on
+# `helm upgrade` by design — re-apply crds/ manually when the schema changes.)
 
 # Namespace where the operator is deployed.
 namespace: nvidia-system

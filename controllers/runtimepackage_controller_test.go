@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,10 +12,37 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	runtimev1alpha1 "github.com/nissandutta31-maker/kubernetes/api/v1alpha1"
 )
+
+// bumpVersion updates spec.version on the named RuntimePackage via the client.
+func bumpVersion(t *testing.T, ctx context.Context, c client.Client, key types.NamespacedName, version string) {
+	t.Helper()
+	cur := &runtimev1alpha1.RuntimePackage{}
+	if err := c.Get(ctx, key, cur); err != nil {
+		t.Fatalf("get for version bump: %v", err)
+	}
+	cur.Spec.Version = version
+	if err := c.Update(ctx, cur); err != nil {
+		t.Fatalf("update version: %v", err)
+	}
+}
+
+// enableAutoUpgrade flips spec.autoUpgrade to true on the named RuntimePackage.
+func enableAutoUpgrade(t *testing.T, ctx context.Context, c client.Client, key types.NamespacedName) {
+	t.Helper()
+	cur := &runtimev1alpha1.RuntimePackage{}
+	if err := c.Get(ctx, key, cur); err != nil {
+		t.Fatalf("get for autoUpgrade: %v", err)
+	}
+	cur.Spec.AutoUpgrade = true
+	if err := c.Update(ctx, cur); err != nil {
+		t.Fatalf("update autoUpgrade: %v", err)
+	}
+}
 
 func newTestScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -158,6 +186,141 @@ func TestPackageImage_Override(t *testing.T) {
 	want := "nvcr.io/nvidia/k8s/nvidia-container-toolkit-installer:1.14.6"
 	if got := PackageImage(pkg); got != want {
 		t.Errorf("fallback image: want %q got %q", want, got)
+	}
+}
+
+func TestReconcile_AutoUpgradeGating(t *testing.T) {
+	s := newTestScheme(t)
+	ctx := context.Background()
+	pkg := &runtimev1alpha1.RuntimePackage{
+		ObjectMeta: metav1.ObjectMeta{Name: "nct", Namespace: "nvidia-system"},
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:         "nvidia-container-toolkit",
+			Version:             "1.14.6",
+			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
+			AutoUpgrade:         false,
+		},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(pkg).WithStatusSubresource(pkg).Build()
+	r := &RuntimePackageReconciler{Client: fc, Scheme: s}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "nct", Namespace: "nvidia-system"}}
+	dsKey := types.NamespacedName{Name: DaemonSetName(pkg), Namespace: "nvidia-system"}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (create): %v", err)
+	}
+
+	// Bump the version while autoUpgrade is false — the DaemonSet must NOT roll.
+	bumpVersion(t, ctx, fc, req.NamespacedName, "1.15.0")
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (gated): %v", err)
+	}
+	ds := &appsv1.DaemonSet{}
+	if err := fc.Get(ctx, dsKey, ds); err != nil {
+		t.Fatalf("get ds: %v", err)
+	}
+	if got := envValue(ds.Spec.Template.Spec.Containers[0].Env, "PACKAGE_VERSION"); got != "1.14.6" {
+		t.Errorf("autoUpgrade=false must not roll: PACKAGE_VERSION = %q, want 1.14.6", got)
+	}
+
+	// Enable autoUpgrade — now the roll should happen.
+	enableAutoUpgrade(t, ctx, fc, req.NamespacedName)
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (roll): %v", err)
+	}
+	if err := fc.Get(ctx, dsKey, ds); err != nil {
+		t.Fatalf("get ds: %v", err)
+	}
+	if got := envValue(ds.Spec.Template.Spec.Containers[0].Env, "PACKAGE_VERSION"); got != "1.15.0" {
+		t.Errorf("autoUpgrade=true must roll: PACKAGE_VERSION = %q, want 1.15.0", got)
+	}
+}
+
+func TestReconcile_PinnedImageVersionBumpStillRolls(t *testing.T) {
+	s := newTestScheme(t)
+	ctx := context.Background()
+	pkg := &runtimev1alpha1.RuntimePackage{
+		ObjectMeta: metav1.ObjectMeta{Name: "nct", Namespace: "nvidia-system"},
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:         "nvidia-container-toolkit",
+			Version:             "1.14.6",
+			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
+			InstallerImage:      "busybox:1.36", // pinned: does NOT change with version
+			AutoUpgrade:         true,
+		},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(pkg).WithStatusSubresource(pkg).Build()
+	r := &RuntimePackageReconciler{Client: fc, Scheme: s}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "nct", Namespace: "nvidia-system"}}
+	dsKey := types.NamespacedName{Name: DaemonSetName(pkg), Namespace: "nvidia-system"}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (create): %v", err)
+	}
+	bumpVersion(t, ctx, fc, req.NamespacedName, "1.15.0")
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (roll): %v", err)
+	}
+	ds := &appsv1.DaemonSet{}
+	if err := fc.Get(ctx, dsKey, ds); err != nil {
+		t.Fatalf("get ds: %v", err)
+	}
+	// Image stays pinned, but the version-bearing env must have rolled — otherwise a
+	// version change with a pinned image would be silently ignored.
+	if ds.Spec.Template.Spec.Containers[0].Image != "busybox:1.36" {
+		t.Errorf("pinned image changed unexpectedly: %q", ds.Spec.Template.Spec.Containers[0].Image)
+	}
+	if got := envValue(ds.Spec.Template.Spec.Containers[0].Env, "PACKAGE_VERSION"); got != "1.15.0" {
+		t.Errorf("version bump with pinned image must still roll env: PACKAGE_VERSION = %q", got)
+	}
+}
+
+func TestReconcile_NoMatchingNodesPending(t *testing.T) {
+	s := newTestScheme(t)
+	pkg := &runtimev1alpha1.RuntimePackage{
+		ObjectMeta: metav1.ObjectMeta{Name: "nct", Namespace: "nvidia-system"},
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:         "nvidia-container-toolkit",
+			Version:             "1.14.6",
+			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
+			NodeSelector:        map[string]string{"nvidia.com/gpu.present": "true"},
+		},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(pkg).WithStatusSubresource(pkg).Build()
+	r := &RuntimePackageReconciler{Client: fc, Scheme: s}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "nct", Namespace: "nvidia-system"}}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := &runtimev1alpha1.RuntimePackage{}
+	if err := fc.Get(context.Background(), req.NamespacedName, got); err != nil {
+		t.Fatalf("get pkg: %v", err)
+	}
+	// No matching nodes → Pending, not stuck in Installing.
+	if got.Status.Phase != runtimev1alpha1.PackagePhasePending {
+		t.Errorf("phase with zero matching nodes: want Pending got %q", got.Status.Phase)
+	}
+}
+
+func TestBuildDaemonSet_ValidationScript(t *testing.T) {
+	pkg := &runtimev1alpha1.RuntimePackage{
+		ObjectMeta: metav1.ObjectMeta{Name: "nct", Namespace: "nvidia-system"},
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:         "nvidia-container-toolkit",
+			Version:             "1.14.6",
+			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
+			ValidationScript:    "nvidia-smi -L",
+		},
+	}
+	ds := buildDaemonSet(pkg)
+	c := ds.Spec.Template.Spec.Containers[0]
+	if got := envValue(c.Env, "VALIDATION_SCRIPT"); got != "nvidia-smi -L" {
+		t.Errorf("VALIDATION_SCRIPT env: want %q got %q", "nvidia-smi -L", got)
+	}
+	// The installer command must actually execute the validation script.
+	if len(c.Args) == 0 || !strings.Contains(c.Args[0], "VALIDATION_SCRIPT") {
+		t.Errorf("installer command does not reference VALIDATION_SCRIPT: %v", c.Args)
 	}
 }
 

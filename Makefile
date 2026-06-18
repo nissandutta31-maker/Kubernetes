@@ -67,6 +67,7 @@ uninstall:
 
 ## deploy: deploy the operator into nvidia-system namespace
 deploy:
+	kubectl create namespace nvidia-system --dry-run=client -o yaml | kubectl apply -f -
 	kubectl apply -f config/rbac/
 	kubectl apply -f config/manager/
 
