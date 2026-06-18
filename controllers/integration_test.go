@@ -296,6 +296,58 @@ func TestIntegration_InstallerImagePreserved(t *testing.T) {
 	t.Logf("✓ controller used the override image for the installer DaemonSet")
 }
 
+// TestIntegration_ReadyRequiresAllTargetedNodes proves the package does not report
+// Ready when the installer scheduled onto fewer nodes than it targets (e.g. because
+// some targeted nodes are tainted/unschedulable).
+func TestIntegration_ReadyRequiresAllTargetedNodes(t *testing.T) {
+	ctx := context.Background()
+	ns := "partial-ns"
+	mustCreateNamespace(t, ctx, ns)
+
+	// Three targeted GPU nodes.
+	for _, name := range []string{"p-node-a", "p-node-b", "p-node-c"} {
+		mustCreateGPUNode(t, ctx, name)
+	}
+
+	pkg := &runtimev1alpha1.RuntimePackage{
+		ObjectMeta: metav1.ObjectMeta{Name: "partial", Namespace: ns},
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:         "nvidia-container-toolkit",
+			Version:             "1.14.6",
+			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
+			NodeSelector:        map[string]string{"nvidia.com/gpu.present": "true"},
+		},
+	}
+	if err := k8sClient.Create(ctx, pkg); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	r := &RuntimePackageReconciler{Client: k8sClient, Scheme: testScheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: pkg.Name, Namespace: ns}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile #1: %v", err)
+	}
+
+	// Installer scheduled and ready on only 2 of the 3 targeted nodes.
+	ds := &appsv1.DaemonSet{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: DaemonSetName(pkg), Namespace: ns}, ds); err != nil {
+		t.Fatalf("get ds: %v", err)
+	}
+	ds.Status.DesiredNumberScheduled = 2
+	ds.Status.NumberReady = 2
+	if err := k8sClient.Status().Update(ctx, ds); err != nil {
+		t.Fatalf("set ds status: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile #2: %v", err)
+	}
+
+	got := mustGet(t, ctx, pkg.Name, ns)
+	if got.Status.Phase == runtimev1alpha1.PackagePhaseReady {
+		t.Fatalf("must NOT be Ready with 2/3 targeted nodes installed, got phase=%s", got.Status.Phase)
+	}
+	t.Logf("✓ 2/3 targeted nodes → phase=%s (not Ready), as expected", got.Status.Phase)
+}
+
 // --- helpers ---
 
 func mustCreateNamespace(t *testing.T, ctx context.Context, name string) {

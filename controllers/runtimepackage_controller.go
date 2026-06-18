@@ -22,7 +22,27 @@ import (
 const (
 	conditionTypeReady = "Ready"
 	requeueInterval    = 30 * time.Second
+
+	// defaultGPUNodeLabel scopes the installer to GPU nodes when a RuntimePackage
+	// omits an explicit nodeSelector. Without this, an empty selector would let the
+	// privileged, host-mounting installer DaemonSet schedule on every node.
+	defaultGPUNodeLabelKey   = "nvidia.com/gpu.present"
+	defaultGPUNodeLabelValue = "true"
 )
+
+// effectiveNodeSelector returns the node selector the operator actually targets:
+// the user's selector when set, otherwise a safe default restricting installs to
+// GPU nodes. The returned map is always a fresh copy.
+func effectiveNodeSelector(pkg *runtimev1alpha1.RuntimePackage) map[string]string {
+	if len(pkg.Spec.NodeSelector) == 0 {
+		return map[string]string{defaultGPUNodeLabelKey: defaultGPUNodeLabelValue}
+	}
+	out := make(map[string]string, len(pkg.Spec.NodeSelector))
+	for k, v := range pkg.Spec.NodeSelector {
+		out[k] = v
+	}
+	return out
+}
 
 // RuntimePackageReconciler reconciles RuntimePackage objects.
 //
@@ -54,7 +74,7 @@ func (r *RuntimePackageReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	logger.Info("reconciling", "package", pkg.Spec.PackageName, "version", pkg.Spec.Version)
 
-	totalNodes, err := r.countMatchingNodes(ctx, pkg.Spec.NodeSelector)
+	totalNodes, err := r.countMatchingNodes(ctx, effectiveNodeSelector(pkg))
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("counting target nodes: %w", err)
 	}
@@ -139,13 +159,16 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	case totalNodes == 0:
 		phase = runtimev1alpha1.PackagePhasePending
 		message = "waiting for nodes matching the node selector"
-	case desired > 0 && readyNodes == desired:
+	case desired == totalNodes && readyNodes == totalNodes:
+		// Ready only when every targeted node — not just every *scheduled* one — has
+		// the package. desired can be < totalNodes if some targeted nodes can't run
+		// the installer (e.g. taints), which must not read as Ready.
 		phase = runtimev1alpha1.PackagePhaseReady
 		installedVersion = deployedVersion
 		message = fmt.Sprintf("%s v%s installed on %d node(s)", pkg.Spec.PackageName, deployedVersion, readyNodes)
 	default:
 		phase = runtimev1alpha1.PackagePhaseInstalling
-		message = fmt.Sprintf("waiting for nodes: %d/%d ready", readyNodes, desired)
+		message = fmt.Sprintf("waiting for nodes: %d/%d ready (%d scheduled)", readyNodes, totalNodes, desired)
 	}
 
 	// Surface a gated upgrade so it is not silently ignored.
@@ -235,10 +258,7 @@ func buildDaemonSet(pkg *runtimev1alpha1.RuntimePackage) *appsv1.DaemonSet {
 		"runtime.nvidia.com/package":   pkg.Spec.PackageName,
 	}
 
-	nodeSelector := make(map[string]string, len(pkg.Spec.NodeSelector))
-	for k, v := range pkg.Spec.NodeSelector {
-		nodeSelector[k] = v
-	}
+	nodeSelector := effectiveNodeSelector(pkg)
 
 	gracePeriod := int64(30)
 	privileged := true

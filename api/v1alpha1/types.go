@@ -40,6 +40,8 @@ type RuntimePackageSpec struct {
 	TargetArchitectures []GPUArchitecture `json:"targetArchitectures"`
 
 	// NodeSelector restricts installation to nodes matching all listed labels.
+	// When omitted, the operator targets GPU nodes only (nvidia.com/gpu.present=true)
+	// so the privileged installer never schedules cluster-wide.
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 

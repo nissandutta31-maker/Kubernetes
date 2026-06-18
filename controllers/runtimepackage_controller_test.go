@@ -303,6 +303,29 @@ func TestReconcile_NoMatchingNodesPending(t *testing.T) {
 	}
 }
 
+func TestBuildDaemonSet_DefaultsToGPUNodes(t *testing.T) {
+	// No nodeSelector → installer must be scoped to GPU nodes, never cluster-wide.
+	pkg := &runtimev1alpha1.RuntimePackage{
+		ObjectMeta: metav1.ObjectMeta{Name: "nct", Namespace: "nvidia-system"},
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:         "nvidia-container-toolkit",
+			Version:             "1.14.6",
+			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
+		},
+	}
+	ds := buildDaemonSet(pkg)
+	sel := ds.Spec.Template.Spec.NodeSelector
+	if sel["nvidia.com/gpu.present"] != "true" {
+		t.Errorf("empty nodeSelector must default to GPU nodes, got %v", sel)
+	}
+
+	// An explicit selector is honored verbatim.
+	pkg.Spec.NodeSelector = map[string]string{"custom/label": "x"}
+	if got := buildDaemonSet(pkg).Spec.Template.Spec.NodeSelector["custom/label"]; got != "x" {
+		t.Errorf("explicit selector not honored: %v", got)
+	}
+}
+
 func TestBuildDaemonSet_ValidationScript(t *testing.T) {
 	pkg := &runtimev1alpha1.RuntimePackage{
 		ObjectMeta: metav1.ObjectMeta{Name: "nct", Namespace: "nvidia-system"},
