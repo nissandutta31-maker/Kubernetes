@@ -74,7 +74,7 @@ def format_output(namespace: str, pods: list[dict[str, Any]]) -> None:
     if not pods:
         print("  ⚠️  No pods found in this namespace.")
         print(f"{divider}\n")
-        return
+        sys.exit(1)
 
     summary = summarize(pods)
 
@@ -109,6 +109,7 @@ def format_output(namespace: str, pods: list[dict[str, Any]]) -> None:
         print(f"\n  🎉 All {running} pods are healthy and running!")
     else:
         print(f"\n  📊 {running}/{total} pods are in Running state.")
+        sys.exit(1)
 
     print(f"{divider}\n")
 

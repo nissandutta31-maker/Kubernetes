@@ -1,0 +1,7 @@
+{
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "install": "cd app && go mod download",
+  "start": "sudo service docker start 2>/dev/null || true"
+}
