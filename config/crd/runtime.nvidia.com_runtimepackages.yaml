@@ -94,6 +94,12 @@ spec:
                 description: Optional shell script executed post-install to verify
                   the package (e.g. runs nvidia-smi checks).
                 type: string
+              installerImage:
+                description: Optional override for the installer DaemonSet container
+                  image. When empty, the operator derives the image from the NVIDIA
+                  NGC registry convention. Override it to point at a private mirror,
+                  an air-gapped registry, or a public stand-in image for local testing.
+                type: string
           status:
             type: object
             properties:

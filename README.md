@@ -13,6 +13,12 @@ architectures, node selector) and the controller ensures that an installer
 DaemonSet exists on every matching node, automatically handling installs and
 rolling upgrades.
 
+> **New to Kubernetes? Start here →** [`docs/HANDS-ON.md`](docs/HANDS-ON.md) is a
+> from-zero, run-it-yourself walkthrough (~60 min) that gets you to where you can
+> demo *and explain* this operator. Fastest taste: `make test-integration` (runs
+> the full lifecycle against a real API server — no Docker) or `make demo` (full
+> demo on a local kind cluster).
+
 ```
 Operator (controller-manager)
   └── watches RuntimePackage CRs
@@ -91,12 +97,17 @@ helm install nvidia-runtime-operator helm/nvidia-runtime-operator \
 ## Development
 
 ```bash
-make test        # run unit tests with race detection
-make build       # compile the operator binary
+make test              # run unit tests with race detection
+make test-integration  # run integration tests against a real API server (envtest)
+make build             # compile the operator binary
+make run               # run the operator locally against your kubeconfig
+make demo              # full guided end-to-end demo on a local kind cluster
 make docker-push IMG=your-registry/nvidia-runtime-operator:dev
-make manifests   # re-generate CRD YAML after type changes
-make generate    # re-generate deepcopy methods after type changes
+make manifests         # re-generate CRD YAML after type changes
+make generate          # re-generate deepcopy methods after type changes
 ```
+
+See [`docs/HANDS-ON.md`](docs/HANDS-ON.md) for the full guided walkthrough.
 
 ## Architecture
 
@@ -110,6 +121,7 @@ make generate    # re-generate deepcopy methods after type changes
 | `spec.nodeSelector`         | Labels filtering target nodes                       |
 | `spec.autoUpgrade`          | Roll a new DaemonSet image when version changes     |
 | `spec.validationScript`     | Post-install script (e.g. `nvidia-smi` smoke test)  |
+| `spec.installerImage`       | Optional image override (mirror / air-gap / testing)|
 
 ### Controller Reconcile Loop
 

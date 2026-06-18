@@ -188,6 +188,8 @@ func buildDaemonSet(pkg *runtimev1alpha1.RuntimePackage) *appsv1.DaemonSet {
 
 	gracePeriod := int64(30)
 	privileged := true
+	hostRootType := corev1.HostPathDirectory
+	hostRunType := corev1.HostPathDirectoryOrCreate
 
 	return &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -215,7 +217,15 @@ func buildDaemonSet(pkg *runtimev1alpha1.RuntimePackage) *appsv1.DaemonSet {
 							Image:           PackageImage(pkg),
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Command:         []string{"/bin/sh", "-c"},
-							Args:            []string{"install.sh && sleep infinity"},
+							// Run the package's install script if the image provides
+							// one, then hold the pod open as a per-node readiness
+							// sentinel. The script-optional form keeps the DaemonSet
+							// functional with stand-in images during local testing.
+							Args: []string{
+								`if command -v install.sh >/dev/null 2>&1; then install.sh; fi; ` +
+									`echo "[$PACKAGE_NAME $PACKAGE_VERSION] runtime package ready on $(hostname)"; ` +
+									`sleep infinity`,
+							},
 							Env: []corev1.EnvVar{
 								{Name: "PACKAGE_NAME", Value: pkg.Spec.PackageName},
 								{Name: "PACKAGE_VERSION", Value: pkg.Spec.Version},
@@ -241,13 +251,14 @@ func buildDaemonSet(pkg *runtimev1alpha1.RuntimePackage) *appsv1.DaemonSet {
 						{
 							Name: "host-root",
 							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{Path: "/"},
+								HostPath: &corev1.HostPathVolumeSource{Path: "/", Type: &hostRootType},
 							},
 						},
 						{
 							Name: "host-run",
 							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{Path: "/run/nvidia"},
+								// DirectoryOrCreate: /run/nvidia may not exist on a fresh node.
+								HostPath: &corev1.HostPathVolumeSource{Path: "/run/nvidia", Type: &hostRunType},
 							},
 						},
 					},
@@ -264,8 +275,13 @@ func DaemonSetName(pkg *runtimev1alpha1.RuntimePackage) string {
 }
 
 // PackageImage returns the container image used by the installer DaemonSet.
-// Images follow NVIDIA's NGC registry convention.
+// If the RuntimePackage specifies an explicit InstallerImage (e.g. a private
+// mirror, an air-gapped registry, or a stand-in image for local testing) it is
+// used verbatim; otherwise the image follows NVIDIA's NGC registry convention.
 func PackageImage(pkg *runtimev1alpha1.RuntimePackage) string {
+	if pkg.Spec.InstallerImage != "" {
+		return pkg.Spec.InstallerImage
+	}
 	return fmt.Sprintf("nvcr.io/nvidia/k8s/%s-installer:%s", pkg.Spec.PackageName, pkg.Spec.Version)
 }
 

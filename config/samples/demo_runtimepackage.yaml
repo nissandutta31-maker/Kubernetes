@@ -1,0 +1,27 @@
+---
+# Demo RuntimePackage for a local kind cluster.
+#
+# This is identical in shape to the production samples in
+# runtime_v1alpha1_runtimepackage.yaml, with ONE difference: it sets
+# `installerImage` to a small public image (busybox) instead of NVIDIA's
+# private NGC installer image. That lets the installer DaemonSet pods actually
+# start on your laptop and drive the RuntimePackage all the way to `Ready` —
+# the real nvcr.io images require NGC authentication and won't pull locally.
+#
+# Everything else — the CRD, the controller, the DaemonSet it builds, the
+# reconcile/upgrade logic — is exactly what runs in production.
+apiVersion: runtime.nvidia.com/v1alpha1
+kind: RuntimePackage
+metadata:
+  name: demo-container-toolkit
+  namespace: nvidia-system
+spec:
+  packageName: nvidia-container-toolkit
+  version: "1.14.6"
+  targetArchitectures:
+  - H100
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  autoUpgrade: true
+  # Public stand-in image so the demo runs without NGC credentials.
+  installerImage: "busybox:1.36"

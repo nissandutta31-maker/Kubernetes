@@ -140,6 +140,27 @@ func TestPackageImage(t *testing.T) {
 	}
 }
 
+func TestPackageImage_Override(t *testing.T) {
+	pkg := &runtimev1alpha1.RuntimePackage{
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:    "nvidia-container-toolkit",
+			Version:        "1.14.6",
+			InstallerImage: "registry.example.com/mirror/toolkit:1.14.6",
+		},
+	}
+	// An explicit InstallerImage must be used verbatim (mirror / air-gap / testing).
+	if got := PackageImage(pkg); got != "registry.example.com/mirror/toolkit:1.14.6" {
+		t.Errorf("override not honored: got %q", got)
+	}
+
+	// With no override, fall back to the NGC convention.
+	pkg.Spec.InstallerImage = ""
+	want := "nvcr.io/nvidia/k8s/nvidia-container-toolkit-installer:1.14.6"
+	if got := PackageImage(pkg); got != want {
+		t.Errorf("fallback image: want %q got %q", want, got)
+	}
+}
+
 func TestSetCondition_Upsert(t *testing.T) {
 	conditions := []metav1.Condition{}
 	cond := metav1.Condition{

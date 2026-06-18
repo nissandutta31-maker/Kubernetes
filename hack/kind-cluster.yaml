@@ -1,0 +1,12 @@
+# kind cluster for the NVIDIA Runtime Operator hands-on demo.
+#
+# One control-plane node + two workers. The workers stand in for GPU nodes:
+# the demo labels them `nvidia.com/gpu.present=true` so the operator's
+# NodeSelector targets them, exactly as it would target real H100/GB200 nodes.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: nvidia-demo
+nodes:
+- role: control-plane
+- role: worker
+- role: worker

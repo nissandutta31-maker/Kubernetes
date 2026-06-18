@@ -51,6 +51,14 @@ type RuntimePackageSpec struct {
 	// verify the package works correctly (e.g. nvidia-smi checks).
 	// +optional
 	ValidationScript string `json:"validationScript,omitempty"`
+
+	// InstallerImage optionally overrides the container image used by the
+	// installer DaemonSet. When empty, the operator derives the image from the
+	// NVIDIA NGC registry convention (nvcr.io/nvidia/k8s/<package>-installer:<version>).
+	// Override it to point at a private mirror, an air-gapped registry, or — for
+	// local testing — a public stand-in image.
+	// +optional
+	InstallerImage string `json:"installerImage,omitempty"`
 }
 
 // RuntimePackageStatus defines the observed state of a RuntimePackage.
