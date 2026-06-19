@@ -145,6 +145,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 
 	// --- Simulate the DaemonSet's pods becoming Ready on both nodes ---
 	ds.Status.DesiredNumberScheduled = 2
+	ds.Status.UpdatedNumberScheduled = 2
 	ds.Status.NumberReady = 2
 	ds.Status.NumberAvailable = 2
 	if err := k8sClient.Status().Update(ctx, ds); err != nil {
@@ -200,6 +201,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 		t.Fatalf("get DaemonSet: %v", err)
 	}
 	ds.Status.DesiredNumberScheduled = 2
+	ds.Status.UpdatedNumberScheduled = 2
 	ds.Status.NumberReady = 2
 	ds.Status.NumberAvailable = 2
 	if err := k8sClient.Status().Update(ctx, ds); err != nil {

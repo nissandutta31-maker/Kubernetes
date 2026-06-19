@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -23,12 +24,27 @@ const (
 	conditionTypeReady = "Ready"
 	requeueInterval    = 30 * time.Second
 
+	// failureDetectionWindow is how long all installer pods must be continuously
+	// unavailable before the controller transitions to Failed. This guards against
+	// transient restarts while still surfacing persistent crash-loops.
+	failureDetectionWindow = 5 * time.Minute
+
 	// defaultGPUNodeLabel scopes the installer to GPU nodes when a RuntimePackage
 	// omits an explicit nodeSelector. Without this, an empty selector would let the
 	// privileged, host-mounting installer DaemonSet schedule on every node.
 	defaultGPUNodeLabelKey   = "nvidia.com/gpu.present"
 	defaultGPUNodeLabelValue = "true"
 )
+
+// archFamily maps each supported GPU architecture to the nvidia.com/gpu.family
+// label applied by NVIDIA GPU Feature Discovery (GFD). GB200 and GB300 are both
+// Blackwell-family GPUs.
+var archFamily = map[runtimev1alpha1.GPUArchitecture]string{
+	runtimev1alpha1.ArchA100:  "ampere",
+	runtimev1alpha1.ArchH100:  "hopper",
+	runtimev1alpha1.ArchGB200: "blackwell",
+	runtimev1alpha1.ArchGB300: "blackwell",
+}
 
 // effectiveNodeSelector returns the node selector the operator actually targets:
 // the user's selector when set, otherwise a safe default restricting installs to
@@ -98,7 +114,14 @@ func (r *RuntimePackageReconciler) createDaemonSet(ctx context.Context, pkg *run
 	}
 	log.FromContext(ctx).Info("creating installer DaemonSet", "name", newDS.Name)
 	if err := r.Create(ctx, newDS); err != nil {
-		return ctrl.Result{}, fmt.Errorf("creating DaemonSet: %w", err)
+		if !errors.IsAlreadyExists(err) {
+			return ctrl.Result{}, fmt.Errorf("creating DaemonSet: %w", err)
+		}
+		// A concurrent reconcile already created it — fetch and sync normally.
+		if fetchErr := r.Get(ctx, types.NamespacedName{Name: newDS.Name, Namespace: newDS.Namespace}, newDS); fetchErr != nil {
+			return ctrl.Result{}, fetchErr
+		}
+		return r.syncDaemonSet(ctx, pkg, newDS, totalNodes)
 	}
 	// With no matching nodes yet, the package is Pending rather than Installing —
 	// there is nothing to install until target nodes join.
@@ -127,10 +150,11 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	versionChanged := deployedVersion != pkg.Spec.Version
 
 	// Detect drift across every field we manage — image, env (carries the version and
-	// validation script), and node targeting — not just the image.
+	// validation script), node targeting, and GPU architecture affinity.
 	drift := currentC.Image != desiredC.Image ||
 		!equalEnv(currentC.Env, desiredC.Env) ||
-		!equalStringMap(ds.Spec.Template.Spec.NodeSelector, desiredDS.Spec.Template.Spec.NodeSelector)
+		!equalStringMap(ds.Spec.Template.Spec.NodeSelector, desiredDS.Spec.Template.Spec.NodeSelector) ||
+		!reflect.DeepEqual(ds.Spec.Template.Spec.Affinity, desiredDS.Spec.Template.Spec.Affinity)
 
 	// Roll the DaemonSet only when there is drift AND either it is not a version change
 	// or auto-upgrade is enabled. This honors spec.autoUpgrade=false (no surprise rolls).
@@ -140,6 +164,7 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 		ds.Spec.Template.Spec.Containers[0].Env = desiredC.Env
 		ds.Spec.Template.Spec.Containers[0].Args = desiredC.Args
 		ds.Spec.Template.Spec.NodeSelector = desiredDS.Spec.Template.Spec.NodeSelector
+		ds.Spec.Template.Spec.Affinity = desiredDS.Spec.Template.Spec.Affinity
 		if err := r.Update(ctx, ds); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating DaemonSet: %w", err)
 		}
@@ -159,13 +184,37 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	case totalNodes == 0:
 		phase = runtimev1alpha1.PackagePhasePending
 		message = "waiting for nodes matching the node selector"
-	case desired == totalNodes && readyNodes == totalNodes:
-		// Ready only when every targeted node — not just every *scheduled* one — has
-		// the package. desired can be < totalNodes if some targeted nodes can't run
-		// the installer (e.g. taints), which must not read as Ready.
+
+	// All scheduled pods have been unavailable for longer than the detection window —
+	// likely crash-looping. Surface Failed so the operator is visible in kubectl.
+	// Requires DesiredNumberScheduled > 0 so we don't misfire before the first pod
+	// schedules, and a time gate so transient restarts don't trigger prematurely.
+	case ds.Status.DesiredNumberScheduled > 0 &&
+		ds.Status.NumberUnavailable == ds.Status.DesiredNumberScheduled &&
+		time.Since(ds.CreationTimestamp.Time) > failureDetectionWindow:
+		phase = runtimev1alpha1.PackagePhaseFailed
+		message = fmt.Sprintf("installer pods unavailable on all %d scheduled node(s); check pod logs",
+			ds.Status.DesiredNumberScheduled)
+
+	case desired == totalNodes &&
+		readyNodes == totalNodes &&
+		ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled:
+		// Ready only when every targeted node has the package installed on the current
+		// DaemonSet revision. Checking UpdatedNumberScheduled prevents prematurely
+		// reporting Ready while old pods are still being replaced during a rolling update.
 		phase = runtimev1alpha1.PackagePhaseReady
 		installedVersion = deployedVersion
 		message = fmt.Sprintf("%s v%s installed on %d node(s)", pkg.Spec.PackageName, deployedVersion, readyNodes)
+
+	// Upgrade in progress: pods are rolling to a new revision. Only shown after at
+	// least one successful install (InstalledVersion set) to distinguish from the
+	// initial install where UpdatedNumberScheduled also starts at zero.
+	case pkg.Status.InstalledVersion != "" &&
+		ds.Status.UpdatedNumberScheduled < ds.Status.DesiredNumberScheduled:
+		phase = runtimev1alpha1.PackagePhaseUpgrading
+		message = fmt.Sprintf("rolling out: %d/%d pods updated to v%s",
+			ds.Status.UpdatedNumberScheduled, ds.Status.DesiredNumberScheduled, pkg.Spec.Version)
+
 	default:
 		phase = runtimev1alpha1.PackagePhaseInstalling
 		message = fmt.Sprintf("waiting for nodes: %d/%d ready (%d scheduled)", readyNodes, totalNodes, desired)
@@ -220,12 +269,9 @@ func (r *RuntimePackageReconciler) patchStatus(
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
 	}
 
-	// Ready is terminal; every other phase requeues. Pending in particular requeues
-	// so the operator notices when matching nodes join later (it watches its own
-	// DaemonSets, not Node objects).
-	if phase == runtimev1alpha1.PackagePhaseReady {
-		return ctrl.Result{}, nil
-	}
+	// Always requeue so the operator detects node additions/removals and DaemonSet
+	// scheduling changes even when the package is Ready — the owned-DaemonSet watch
+	// covers most events but not every node-label change that affects totalNodes.
 	return ctrl.Result{RequeueAfter: requeueInterval}, nil
 }
 
@@ -275,7 +321,7 @@ func buildDaemonSet(pkg *runtimev1alpha1.RuntimePackage) *appsv1.DaemonSet {
 		env = append(env, corev1.EnvVar{Name: "VALIDATION_SCRIPT", Value: pkg.Spec.ValidationScript})
 	}
 
-	return &appsv1.DaemonSet{
+	ds := &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      DaemonSetName(pkg),
 			Namespace: pkg.Namespace,
@@ -345,6 +391,50 @@ func buildDaemonSet(pkg *runtimev1alpha1.RuntimePackage) *appsv1.DaemonSet {
 								// DirectoryOrCreate: /run/nvidia may not exist on a fresh node.
 								HostPath: &corev1.HostPathVolumeSource{Path: "/run/nvidia", Type: &hostRunType},
 							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Enforce target GPU architectures via nodeAffinity using the nvidia.com/gpu.family
+	// label applied by NVIDIA GPU Feature Discovery (GFD). This prevents the installer
+	// from running on incompatible GPU nodes (e.g. an A100 runtime package on H100 nodes).
+	// Requires GFD to be installed and labeling nodes in the cluster.
+	if affinity := buildNodeAffinity(pkg.Spec.TargetArchitectures); affinity != nil {
+		ds.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: affinity}
+	}
+
+	return ds
+}
+
+// buildNodeAffinity translates target GPU architectures into a
+// RequiredDuringScheduling NodeAffinity that restricts the installer DaemonSet
+// to nodes carrying the matching nvidia.com/gpu.family label (set by GFD).
+// Multiple architectures are combined with OR semantics via In. Returns nil
+// when no known architecture is provided.
+func buildNodeAffinity(archs []runtimev1alpha1.GPUArchitecture) *corev1.NodeAffinity {
+	families := make([]string, 0, len(archs))
+	seen := make(map[string]bool)
+	for _, a := range archs {
+		if f, ok := archFamily[a]; ok && !seen[f] {
+			families = append(families, f)
+			seen[f] = true
+		}
+	}
+	if len(families) == 0 {
+		return nil
+	}
+	return &corev1.NodeAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{
+				{
+					MatchExpressions: []corev1.NodeSelectorRequirement{
+						{
+							Key:      "nvidia.com/gpu.family",
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   families,
 						},
 					},
 				},
