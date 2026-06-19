@@ -141,13 +141,24 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	deployedVersion := envValue(currentC.Env, "PACKAGE_VERSION")
 	versionChanged := deployedVersion != pkg.Spec.Version
 
-	// configDrift: non-version fields that should always roll, independent of autoUpgrade.
-	// nodeSelector, validationScript, and architecture metadata take effect immediately —
-	// only the package version bump is gated by autoUpgrade.
-	configDrift := !equalStringMap(ds.Spec.Template.Spec.NodeSelector, desiredDS.Spec.Template.Spec.NodeSelector) ||
+	// imageDrift is the observed difference between running and desired container images.
+	// It is "version-driven" only when using the default NGC image (no InstallerImage
+	// override) and spec.version changed — in that case autoUpgrade gates the roll.
+	// All other image changes (override set/changed/cleared, package name changed) are
+	// config-driven and always apply, with full env so image and PACKAGE_VERSION stay
+	// in sync.
+	imageDrift := currentC.Image != desiredC.Image
+	imageIsVersionDriven := versionChanged && pkg.Spec.InstallerImage == ""
+	imageIsConfigDriven := imageDrift && !imageIsVersionDriven
+
+	// configDrift: non-version fields that always roll, independent of autoUpgrade.
+	// Package name, validationScript, architecture metadata, nodeSelector, and
+	// config-driven image changes take effect immediately.
+	configDrift := imageIsConfigDriven ||
+		envValue(currentC.Env, "PACKAGE_NAME") != envValue(desiredC.Env, "PACKAGE_NAME") ||
 		envValue(currentC.Env, "VALIDATION_SCRIPT") != envValue(desiredC.Env, "VALIDATION_SCRIPT") ||
 		envValue(currentC.Env, "PACKAGE_ARCHITECTURES") != envValue(desiredC.Env, "PACKAGE_ARCHITECTURES") ||
-		(pkg.Spec.InstallerImage != "" && currentC.Image != desiredC.Image) // explicit image override is config
+		!equalStringMap(ds.Spec.Template.Spec.NodeSelector, desiredDS.Spec.Template.Spec.NodeSelector)
 
 	shouldRollVersion := versionChanged && pkg.Spec.AutoUpgrade
 	shouldRoll := configDrift || shouldRollVersion
@@ -169,17 +180,17 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 		ds.Spec.Template.Spec.NodeSelector = desiredDS.Spec.Template.Spec.NodeSelector
 		ds.Spec.Template.Spec.Containers[0].Args = desiredC.Args
 
-		if shouldRollVersion || !versionChanged {
-			// Full update: apply image and all env vars (including new PACKAGE_VERSION).
+		if shouldRollVersion || !versionChanged || imageIsConfigDriven {
+			// Full update: version roll is permitted, nothing is version-blocked, or the
+			// image changed for a config reason. Applying the full env when the image
+			// changes for a config reason keeps image and PACKAGE_VERSION consistent.
 			ds.Spec.Template.Spec.Containers[0].Image = desiredC.Image
 			ds.Spec.Template.Spec.Containers[0].Env = desiredC.Env
 		} else {
-			// Config-only roll: apply desired env but preserve the current PACKAGE_VERSION
-			// so autoUpgrade=false is not circumvented by a simultaneous config change.
+			// Config-only roll: non-image config changed (e.g. validationScript) while a
+			// version bump is pending and autoUpgrade=false. Preserve the current image and
+			// PACKAGE_VERSION so the version gate is not circumvented.
 			ds.Spec.Template.Spec.Containers[0].Env = applyConfigEnv(currentC.Env, desiredC.Env)
-			if pkg.Spec.InstallerImage != "" {
-				ds.Spec.Template.Spec.Containers[0].Image = desiredC.Image
-			}
 		}
 
 		if err := r.Update(ctx, ds); err != nil {

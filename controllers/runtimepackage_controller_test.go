@@ -406,6 +406,53 @@ func TestSetCondition_PreservesTransitionTime(t *testing.T) {
 	}
 }
 
+func TestReconcile_PackageNameChange(t *testing.T) {
+	s := newTestScheme(t)
+	ctx := context.Background()
+	pkg := &runtimev1alpha1.RuntimePackage{
+		ObjectMeta: metav1.ObjectMeta{Name: "nct", Namespace: "nvidia-system"},
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:         "nvidia-container-toolkit",
+			Version:             "1.14.6",
+			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
+			AutoUpgrade:         false, // autoUpgrade off; name change must still roll
+		},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(pkg).WithStatusSubresource(pkg).Build()
+	r := &RuntimePackageReconciler{Client: fc, Scheme: s}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "nct", Namespace: "nvidia-system"}}
+	dsKey := types.NamespacedName{Name: DaemonSetName(pkg), Namespace: "nvidia-system"}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (create): %v", err)
+	}
+
+	// Change the package name — must roll even with autoUpgrade=false.
+	cur := &runtimev1alpha1.RuntimePackage{}
+	if err := fc.Get(ctx, req.NamespacedName, cur); err != nil {
+		t.Fatalf("get pkg: %v", err)
+	}
+	cur.Spec.PackageName = "nvidia-dra-driver"
+	if err := fc.Update(ctx, cur); err != nil {
+		t.Fatalf("update pkg: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (name change): %v", err)
+	}
+
+	ds := &appsv1.DaemonSet{}
+	if err := fc.Get(ctx, dsKey, ds); err != nil {
+		t.Fatalf("get ds: %v", err)
+	}
+	if got := envValue(ds.Spec.Template.Spec.Containers[0].Env, "PACKAGE_NAME"); got != "nvidia-dra-driver" {
+		t.Errorf("PACKAGE_NAME not updated: got %q, want nvidia-dra-driver", got)
+	}
+	wantImage := "nvcr.io/nvidia/k8s/nvidia-dra-driver-installer:1.14.6"
+	if got := ds.Spec.Template.Spec.Containers[0].Image; got != wantImage {
+		t.Errorf("image not updated for new package name: got %q, want %q", got, wantImage)
+	}
+}
+
 func TestBuildDaemonSet_GPUToleration(t *testing.T) {
 	pkg := &runtimev1alpha1.RuntimePackage{
 		ObjectMeta: metav1.ObjectMeta{Name: "nct", Namespace: "nvidia-system"},
