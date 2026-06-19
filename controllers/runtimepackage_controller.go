@@ -121,10 +121,10 @@ func (r *RuntimePackageReconciler) createDaemonSet(ctx context.Context, pkg *run
 	// there is nothing to install until target nodes join.
 	if totalNodes == 0 {
 		return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhasePending, "", 0, 0,
-			"waiting for nodes matching the node selector")
+			"waiting for nodes matching the node selector", false)
 	}
 	return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseInstalling, "", 0, totalNodes,
-		fmt.Sprintf("installing %s v%s", pkg.Spec.PackageName, pkg.Spec.Version))
+		fmt.Sprintf("installing %s v%s", pkg.Spec.PackageName, pkg.Spec.Version), false)
 }
 
 func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runtimev1alpha1.RuntimePackage, ds *appsv1.DaemonSet, totalNodes int32) (ctrl.Result, error) {
@@ -148,7 +148,7 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 			}
 		}
 		return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseInstalling, "", 0, totalNodes,
-			fmt.Sprintf("recreating installer DaemonSet for %s", pkg.Spec.PackageName))
+			fmt.Sprintf("recreating installer DaemonSet for %s", pkg.Spec.PackageName), false)
 	}
 
 	// The version actually deployed is whatever the running DaemonSet's pods carry,
@@ -229,10 +229,10 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 		// Report Upgrading only for an actual version roll; config-only rolls report Installing.
 		if shouldRollVersion {
 			return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseUpgrading, "", ds.Status.NumberReady, totalNodes,
-				fmt.Sprintf("upgrading %s to v%s", pkg.Spec.PackageName, pkg.Spec.Version))
+				fmt.Sprintf("upgrading %s to v%s", pkg.Spec.PackageName, pkg.Spec.Version), false)
 		}
 		return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseInstalling, "", ds.Status.NumberReady, totalNodes,
-			fmt.Sprintf("applying config update to %s", pkg.Spec.PackageName))
+			fmt.Sprintf("applying config update to %s", pkg.Spec.PackageName), false)
 	}
 
 	// No roll: track all-pods-unavailable onset for failure detection.
@@ -286,11 +286,14 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	case pkg.Status.InstalledVersion != "" && pkg.Status.InstalledVersion != deployedVersion:
 		since := unavailableSince(pkg.Status.Conditions)
 		rollStart := rolloutStartedAt(pkg.Status.Conditions)
-		// rollStalled: the roll block recorded a start time but the rollout has not
-		// completed within the detection window. This catches the common rolling-update
-		// failure mode where old pods stay Ready while new-revision pods crash, so
-		// allUnavailable never fires yet the upgrade makes no progress.
-		rollStalled := rollStart != nil && time.Since(rollStart.Time) > failureDetectionWindow
+		// rollStalled: rollout started but no progress in the detection window,
+		// AND all updated pods are unavailable (new-revision pods are crashing
+		// while old ones stay Running). This guards against false failures on
+		// large clusters where a healthy rollout simply takes longer than the
+		// detection window because UpdatedNumberScheduled is still advancing.
+		allUpdatedPodsUnavailable := ds.Status.UpdatedNumberScheduled > 0 &&
+			ds.Status.NumberUnavailable >= ds.Status.UpdatedNumberScheduled
+		rollStalled := rollStart != nil && time.Since(rollStart.Time) > failureDetectionWindow && allUpdatedPodsUnavailable
 		if (allUnavailable && since != nil && time.Since(since.Time) > failureDetectionWindow) || rollStalled {
 			phase = runtimev1alpha1.PackagePhaseFailed
 			if allUnavailable {
@@ -326,11 +329,12 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	}
 
 	// Surface a gated upgrade so it is not silently ignored.
-	if versionChanged && !pkg.Spec.AutoUpgrade {
+	upgradeGated := versionChanged && !pkg.Spec.AutoUpgrade
+	if upgradeGated {
 		message += fmt.Sprintf("; upgrade to v%s available (autoUpgrade disabled)", pkg.Spec.Version)
 	}
 
-	return r.patchStatus(ctx, pkg, phase, installedVersion, readyNodes, totalNodes, message)
+	return r.patchStatus(ctx, pkg, phase, installedVersion, readyNodes, totalNodes, message, upgradeGated)
 }
 
 // patchStatus writes the package status. installedVersion is only applied when
@@ -343,6 +347,7 @@ func (r *RuntimePackageReconciler) patchStatus(
 	installedVersion string,
 	readyNodes, totalNodes int32,
 	message string,
+	upgradeGated bool,
 ) (ctrl.Result, error) {
 	now := metav1.Now()
 	pkg.Status.Phase = phase
@@ -365,7 +370,14 @@ func (r *RuntimePackageReconciler) patchStatus(
 	reason := string(phase)
 	if phase == runtimev1alpha1.PackagePhaseReady {
 		condStatus = metav1.ConditionTrue
-		reason = "PackageInstalled"
+		if upgradeGated {
+			// Package is running at the current version but a newer spec.version
+			// is held back by autoUpgrade=false. Signal this via the condition
+			// reason so automated tools can distinguish fully-current from gated.
+			reason = "UpgradePending"
+		} else {
+			reason = "PackageInstalled"
+		}
 	}
 
 	setCondition(&pkg.Status.Conditions, metav1.Condition{
