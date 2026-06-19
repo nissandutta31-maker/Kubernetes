@@ -606,12 +606,13 @@ func unavailableSince(conditions []metav1.Condition) *metav1.Time {
 }
 
 // rolloutStartedAt returns the LastTransitionTime recorded by the roll block
-// on the AllPodsUnavailable=False condition. The roll block uses forceCondition
-// to always refresh this timestamp when a new rollout begins, so it reliably
-// marks when THIS rollout started rather than when the condition last changed state.
+// on the AllPodsUnavailable=False condition. Only matches Reason=="RollingUpdate"
+// so that the normal "PodsAvailable" condition set by the no-roll path is never
+// mistaken for a rollout-start timestamp, preventing false-positive Failed transitions
+// after a leader restart or missed status update.
 func rolloutStartedAt(conditions []metav1.Condition) *metav1.Time {
 	for _, c := range conditions {
-		if c.Type == conditionTypeUnavailable && c.Status == metav1.ConditionFalse {
+		if c.Type == conditionTypeUnavailable && c.Status == metav1.ConditionFalse && c.Reason == "RollingUpdate" {
 			return &c.LastTransitionTime
 		}
 	}
