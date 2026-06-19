@@ -35,7 +35,12 @@ type RuntimePackageSpec struct {
 	// +kubebuilder:validation:Pattern=`^\d+\.\d+\.\d+.*$`
 	Version string `json:"version"`
 
-	// TargetArchitectures lists the GPU architectures this package supports.
+	// TargetArchitectures lists the GPU architectures this package is built for
+	// (e.g. H100, GB200). The operator passes these as the PACKAGE_ARCHITECTURES
+	// environment variable to the installer container, enabling the install script
+	// to select the correct package variant (e.g. CUDA compute capability, driver
+	// variant). For node scheduling scope, use spec.nodeSelector with
+	// nvidia.com/gpu.family labels set by NVIDIA GPU Feature Discovery (GFD).
 	// +kubebuilder:validation:MinItems=1
 	TargetArchitectures []GPUArchitecture `json:"targetArchitectures"`
 

@@ -3,7 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"reflect"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -21,12 +21,15 @@ import (
 )
 
 const (
-	conditionTypeReady = "Ready"
-	requeueInterval    = 30 * time.Second
+	conditionTypeReady       = "Ready"
+	conditionTypeUnavailable = "AllPodsUnavailable"
+	requeueInterval          = 30 * time.Second
 
 	// failureDetectionWindow is how long all installer pods must be continuously
-	// unavailable before the controller transitions to Failed. This guards against
-	// transient restarts while still surfacing persistent crash-loops.
+	// unavailable before the controller transitions to Failed. Measured from the
+	// LastTransitionTime of the AllPodsUnavailable condition, not DaemonSet age,
+	// so a long-lived DaemonSet that experiences a short outage does not
+	// immediately flip to Failed.
 	failureDetectionWindow = 5 * time.Minute
 
 	// defaultGPUNodeLabel scopes the installer to GPU nodes when a RuntimePackage
@@ -35,16 +38,6 @@ const (
 	defaultGPUNodeLabelKey   = "nvidia.com/gpu.present"
 	defaultGPUNodeLabelValue = "true"
 )
-
-// archFamily maps each supported GPU architecture to the nvidia.com/gpu.family
-// label applied by NVIDIA GPU Feature Discovery (GFD). GB200 and GB300 are both
-// Blackwell-family GPUs.
-var archFamily = map[runtimev1alpha1.GPUArchitecture]string{
-	runtimev1alpha1.ArchA100:  "ampere",
-	runtimev1alpha1.ArchH100:  "hopper",
-	runtimev1alpha1.ArchGB200: "blackwell",
-	runtimev1alpha1.ArchGB300: "blackwell",
-}
 
 // effectiveNodeSelector returns the node selector the operator actually targets:
 // the user's selector when set, otherwise a safe default restricting installs to
@@ -143,36 +136,79 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	currentC := ds.Spec.Template.Spec.Containers[0]
 
 	// The version actually deployed is whatever the running DaemonSet's pods carry,
-	// not what the spec currently asks for. Reading it from the pod template (rather
-	// than assuming spec.Version) keeps status honest when an upgrade is gated or the
-	// installer image is pinned via spec.installerImage.
+	// not what the spec currently asks for. Reading it from the pod template keeps
+	// status honest when an upgrade is gated or the installer image is pinned.
 	deployedVersion := envValue(currentC.Env, "PACKAGE_VERSION")
 	versionChanged := deployedVersion != pkg.Spec.Version
 
-	// Detect drift across every field we manage — image, env (carries the version and
-	// validation script), node targeting, and GPU architecture affinity.
-	drift := currentC.Image != desiredC.Image ||
-		!equalEnv(currentC.Env, desiredC.Env) ||
-		!equalStringMap(ds.Spec.Template.Spec.NodeSelector, desiredDS.Spec.Template.Spec.NodeSelector) ||
-		!reflect.DeepEqual(ds.Spec.Template.Spec.Affinity, desiredDS.Spec.Template.Spec.Affinity)
+	// configDrift: non-version fields that should always roll, independent of autoUpgrade.
+	// nodeSelector, validationScript, and architecture metadata take effect immediately —
+	// only the package version bump is gated by autoUpgrade.
+	configDrift := !equalStringMap(ds.Spec.Template.Spec.NodeSelector, desiredDS.Spec.Template.Spec.NodeSelector) ||
+		envValue(currentC.Env, "VALIDATION_SCRIPT") != envValue(desiredC.Env, "VALIDATION_SCRIPT") ||
+		envValue(currentC.Env, "PACKAGE_ARCHITECTURES") != envValue(desiredC.Env, "PACKAGE_ARCHITECTURES") ||
+		(pkg.Spec.InstallerImage != "" && currentC.Image != desiredC.Image) // explicit image override is config
 
-	// Roll the DaemonSet only when there is drift AND either it is not a version change
-	// or auto-upgrade is enabled. This honors spec.autoUpgrade=false (no surprise rolls).
-	if drift && (!versionChanged || pkg.Spec.AutoUpgrade) {
+	shouldRollVersion := versionChanged && pkg.Spec.AutoUpgrade
+	shouldRoll := configDrift || shouldRollVersion
+
+	if shouldRoll {
 		log.FromContext(ctx).Info("rolling installer DaemonSet", "image", desiredC.Image, "version", pkg.Spec.Version)
-		ds.Spec.Template.Spec.Containers[0].Image = desiredC.Image
-		ds.Spec.Template.Spec.Containers[0].Env = desiredC.Env
-		ds.Spec.Template.Spec.Containers[0].Args = desiredC.Args
+
+		// Reset the all-pods-unavailable timer on a roll so the failure detection window
+		// starts fresh after the new DaemonSet generation begins rolling out.
+		setCondition(&pkg.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeUnavailable,
+			Status:             metav1.ConditionFalse,
+			Reason:             "RollingUpdate",
+			ObservedGeneration: pkg.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
+
+		// Config fields always apply immediately.
 		ds.Spec.Template.Spec.NodeSelector = desiredDS.Spec.Template.Spec.NodeSelector
-		ds.Spec.Template.Spec.Affinity = desiredDS.Spec.Template.Spec.Affinity
+		ds.Spec.Template.Spec.Containers[0].Args = desiredC.Args
+
+		if shouldRollVersion || !versionChanged {
+			// Full update: apply image and all env vars (including new PACKAGE_VERSION).
+			ds.Spec.Template.Spec.Containers[0].Image = desiredC.Image
+			ds.Spec.Template.Spec.Containers[0].Env = desiredC.Env
+		} else {
+			// Config-only roll: apply desired env but preserve the current PACKAGE_VERSION
+			// so autoUpgrade=false is not circumvented by a simultaneous config change.
+			ds.Spec.Template.Spec.Containers[0].Env = applyConfigEnv(currentC.Env, desiredC.Env)
+			if pkg.Spec.InstallerImage != "" {
+				ds.Spec.Template.Spec.Containers[0].Image = desiredC.Image
+			}
+		}
+
 		if err := r.Update(ctx, ds); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating DaemonSet: %w", err)
 		}
-		// Leave InstalledVersion untouched (empty) until the new pods are confirmed
-		// ready on a later reconcile — the old version is still what's running.
+		// Leave InstalledVersion untouched until the new pods are confirmed ready.
 		return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseUpgrading, "", ds.Status.NumberReady, totalNodes,
 			fmt.Sprintf("rolling out %s v%s", pkg.Spec.PackageName, pkg.Spec.Version))
 	}
+
+	// No roll: track all-pods-unavailable onset for failure detection.
+	// Using the AllPodsUnavailable condition's LastTransitionTime rather than
+	// ds.CreationTimestamp measures how long the CURRENT unavailability run has
+	// lasted, not how old the DaemonSet is.
+	allUnavailable := ds.Status.DesiredNumberScheduled > 0 &&
+		ds.Status.NumberUnavailable == ds.Status.DesiredNumberScheduled
+	unavailCondStatus := metav1.ConditionFalse
+	unavailReason := "PodsAvailable"
+	if allUnavailable {
+		unavailCondStatus = metav1.ConditionTrue
+		unavailReason = "AllPodsUnavailable"
+	}
+	setCondition(&pkg.Status.Conditions, metav1.Condition{
+		Type:               conditionTypeUnavailable,
+		Status:             unavailCondStatus,
+		Reason:             unavailReason,
+		ObservedGeneration: pkg.Generation,
+		LastTransitionTime: metav1.Now(),
+	})
 
 	// No roll: report readiness for the version currently deployed.
 	readyNodes := ds.Status.NumberReady
@@ -185,16 +221,19 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 		phase = runtimev1alpha1.PackagePhasePending
 		message = "waiting for nodes matching the node selector"
 
-	// All scheduled pods have been unavailable for longer than the detection window —
-	// likely crash-looping. Surface Failed so the operator is visible in kubectl.
-	// Requires DesiredNumberScheduled > 0 so we don't misfire before the first pod
-	// schedules, and a time gate so transient restarts don't trigger prematurely.
-	case ds.Status.DesiredNumberScheduled > 0 &&
-		ds.Status.NumberUnavailable == ds.Status.DesiredNumberScheduled &&
-		time.Since(ds.CreationTimestamp.Time) > failureDetectionWindow:
-		phase = runtimev1alpha1.PackagePhaseFailed
-		message = fmt.Sprintf("installer pods unavailable on all %d scheduled node(s); check pod logs",
-			ds.Status.DesiredNumberScheduled)
+	case allUnavailable:
+		// All pods unavailable: flip to Failed once the detection window expires,
+		// measured from when the AllPodsUnavailable condition was last set True.
+		since := unavailableSince(pkg.Status.Conditions)
+		if since != nil && time.Since(since.Time) > failureDetectionWindow {
+			phase = runtimev1alpha1.PackagePhaseFailed
+			message = fmt.Sprintf("installer pods unavailable on all %d scheduled node(s); check pod logs",
+				ds.Status.DesiredNumberScheduled)
+		} else {
+			phase = runtimev1alpha1.PackagePhaseInstalling
+			message = fmt.Sprintf("waiting for pods: all %d scheduled pod(s) currently unavailable",
+				ds.Status.DesiredNumberScheduled)
+		}
 
 	case desired == totalNodes &&
 		readyNodes == totalNodes &&
@@ -320,6 +359,16 @@ func buildDaemonSet(pkg *runtimev1alpha1.RuntimePackage) *appsv1.DaemonSet {
 	if pkg.Spec.ValidationScript != "" {
 		env = append(env, corev1.EnvVar{Name: "VALIDATION_SCRIPT", Value: pkg.Spec.ValidationScript})
 	}
+	// Pass target architectures as metadata so the installer script can select the
+	// correct package variant (e.g. CUDA compute capability). nodeSelector controls
+	// WHERE the installer runs; PACKAGE_ARCHITECTURES describes WHAT to install.
+	if len(pkg.Spec.TargetArchitectures) > 0 {
+		archStrs := make([]string, len(pkg.Spec.TargetArchitectures))
+		for i, a := range pkg.Spec.TargetArchitectures {
+			archStrs[i] = string(a)
+		}
+		env = append(env, corev1.EnvVar{Name: "PACKAGE_ARCHITECTURES", Value: strings.Join(archStrs, ",")})
+	}
 
 	ds := &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -398,49 +447,7 @@ func buildDaemonSet(pkg *runtimev1alpha1.RuntimePackage) *appsv1.DaemonSet {
 		},
 	}
 
-	// Enforce target GPU architectures via nodeAffinity using the nvidia.com/gpu.family
-	// label applied by NVIDIA GPU Feature Discovery (GFD). This prevents the installer
-	// from running on incompatible GPU nodes (e.g. an A100 runtime package on H100 nodes).
-	// Requires GFD to be installed and labeling nodes in the cluster.
-	if affinity := buildNodeAffinity(pkg.Spec.TargetArchitectures); affinity != nil {
-		ds.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: affinity}
-	}
-
 	return ds
-}
-
-// buildNodeAffinity translates target GPU architectures into a
-// RequiredDuringScheduling NodeAffinity that restricts the installer DaemonSet
-// to nodes carrying the matching nvidia.com/gpu.family label (set by GFD).
-// Multiple architectures are combined with OR semantics via In. Returns nil
-// when no known architecture is provided.
-func buildNodeAffinity(archs []runtimev1alpha1.GPUArchitecture) *corev1.NodeAffinity {
-	families := make([]string, 0, len(archs))
-	seen := make(map[string]bool)
-	for _, a := range archs {
-		if f, ok := archFamily[a]; ok && !seen[f] {
-			families = append(families, f)
-			seen[f] = true
-		}
-	}
-	if len(families) == 0 {
-		return nil
-	}
-	return &corev1.NodeAffinity{
-		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
-			NodeSelectorTerms: []corev1.NodeSelectorTerm{
-				{
-					MatchExpressions: []corev1.NodeSelectorRequirement{
-						{
-							Key:      "nvidia.com/gpu.family",
-							Operator: corev1.NodeSelectorOpIn,
-							Values:   families,
-						},
-					},
-				},
-			},
-		},
-	}
 }
 
 // DaemonSetName returns the deterministic name for the installer DaemonSet
@@ -499,6 +506,32 @@ func equalStringMap(a, b map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// applyConfigEnv returns desired env vars with PACKAGE_VERSION copied from current.
+// Used for config-only rolls (autoUpgrade=false with a pending version bump) to
+// apply changes like VALIDATION_SCRIPT without advancing the deployed package version.
+func applyConfigEnv(current, desired []corev1.EnvVar) []corev1.EnvVar {
+	out := make([]corev1.EnvVar, len(desired))
+	copy(out, desired)
+	currentVersion := envValue(current, "PACKAGE_VERSION")
+	for i, e := range out {
+		if e.Name == "PACKAGE_VERSION" {
+			out[i].Value = currentVersion
+		}
+	}
+	return out
+}
+
+// unavailableSince returns the LastTransitionTime of the AllPodsUnavailable condition
+// when it is True, or nil if it is absent or False (pods are available or recovering).
+func unavailableSince(conditions []metav1.Condition) *metav1.Time {
+	for _, c := range conditions {
+		if c.Type == conditionTypeUnavailable && c.Status == metav1.ConditionTrue {
+			return &c.LastTransitionTime
+		}
+	}
+	return nil
 }
 
 // setCondition upserts a condition into the slice, matching by Type.
