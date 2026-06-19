@@ -186,9 +186,12 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	if shouldRoll {
 		log.FromContext(ctx).Info("rolling installer DaemonSet", "image", desiredC.Image, "version", pkg.Spec.Version)
 
-		// Reset the all-pods-unavailable timer on a roll so the failure detection window
-		// starts fresh after the new DaemonSet generation begins rolling out.
-		setCondition(&pkg.Status.Conditions, metav1.Condition{
+		// Record rollout-start time. forceCondition (not setCondition) is used so
+		// LastTransitionTime is always refreshed to now, even when the package was
+		// already Ready (AllPodsUnavailable=False). setCondition would preserve a
+		// stale timestamp from the previous Ready state, causing rollStalled to
+		// fire immediately on the next upgrade.
+		forceCondition(&pkg.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeUnavailable,
 			Status:             metav1.ConditionFalse,
 			Reason:             "RollingUpdate",
@@ -602,11 +605,10 @@ func unavailableSince(conditions []metav1.Condition) *metav1.Time {
 	return nil
 }
 
-// rolloutStartedAt returns the time the AllPodsUnavailable condition last
-// transitioned to False. The roll block sets the condition to False before
-// updating the DaemonSet template, so its LastTransitionTime serves as the
-// rollout-start timestamp. setCondition preserves it while the status stays
-// False (i.e. while old-revision pods are still Running during the roll).
+// rolloutStartedAt returns the LastTransitionTime recorded by the roll block
+// on the AllPodsUnavailable=False condition. The roll block uses forceCondition
+// to always refresh this timestamp when a new rollout begins, so it reliably
+// marks when THIS rollout started rather than when the condition last changed state.
 func rolloutStartedAt(conditions []metav1.Condition) *metav1.Time {
 	for _, c := range conditions {
 		if c.Type == conditionTypeUnavailable && c.Status == metav1.ConditionFalse {
@@ -625,6 +627,20 @@ func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) {
 			if c.Status == cond.Status {
 				cond.LastTransitionTime = c.LastTransitionTime
 			}
+			(*conditions)[i] = cond
+			return
+		}
+	}
+	*conditions = append(*conditions, cond)
+}
+
+// forceCondition upserts a condition into the slice always using the provided
+// LastTransitionTime, even when the Status has not changed. Use this when the
+// caller needs to record an event time (e.g. rollout start) rather than a
+// status-change time.
+func forceCondition(conditions *[]metav1.Condition, cond metav1.Condition) {
+	for i, c := range *conditions {
+		if c.Type == cond.Type {
 			(*conditions)[i] = cond
 			return
 		}
