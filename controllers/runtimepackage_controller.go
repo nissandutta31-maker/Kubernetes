@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	conditionTypeReady       = "Ready"
-	conditionTypeUnavailable = "AllPodsUnavailable"
+	conditionTypeReady        = "Ready"
+	conditionTypeUnavailable  = "AllPodsUnavailable"
+	conditionTypeRolloutStart = "RolloutInProgress"
 	requeueInterval          = 30 * time.Second
 
 	// failureDetectionWindow is how long all installer pods must be continuously
@@ -186,14 +187,12 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	if shouldRoll {
 		log.FromContext(ctx).Info("rolling installer DaemonSet", "image", desiredC.Image, "version", pkg.Spec.Version)
 
-		// Record rollout-start time. forceCondition (not setCondition) is used so
-		// LastTransitionTime is always refreshed to now, even when the package was
-		// already Ready (AllPodsUnavailable=False). setCondition would preserve a
-		// stale timestamp from the previous Ready state, causing rollStalled to
-		// fire immediately on the next upgrade.
+		// Record rollout-start time on a dedicated condition that the no-roll path
+		// never touches. forceCondition always refreshes LastTransitionTime so
+		// repeated rolls each get a fresh start timestamp.
 		forceCondition(&pkg.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeUnavailable,
-			Status:             metav1.ConditionFalse,
+			Type:               conditionTypeRolloutStart,
+			Status:             metav1.ConditionTrue,
 			Reason:             "RollingUpdate",
 			ObservedGeneration: pkg.Generation,
 			LastTransitionTime: metav1.Now(),
@@ -374,6 +373,18 @@ func (r *RuntimePackageReconciler) patchStatus(
 		ObservedGeneration: pkg.Generation,
 		LastTransitionTime: now,
 	})
+
+	// Clear the rollout-start marker once the rollout resolves (Ready or Failed)
+	// so a future rollout starts with a fresh timer.
+	if phase == runtimev1alpha1.PackagePhaseReady || phase == runtimev1alpha1.PackagePhaseFailed {
+		setCondition(&pkg.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeRolloutStart,
+			Status:             metav1.ConditionFalse,
+			Reason:             string(phase),
+			ObservedGeneration: pkg.Generation,
+			LastTransitionTime: now,
+		})
+	}
 
 	if err := r.Status().Update(ctx, pkg); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
@@ -605,14 +616,14 @@ func unavailableSince(conditions []metav1.Condition) *metav1.Time {
 	return nil
 }
 
-// rolloutStartedAt returns the LastTransitionTime recorded by the roll block
-// on the AllPodsUnavailable=False condition. Only matches Reason=="RollingUpdate"
-// so that the normal "PodsAvailable" condition set by the no-roll path is never
-// mistaken for a rollout-start timestamp, preventing false-positive Failed transitions
-// after a leader restart or missed status update.
+// rolloutStartedAt returns the timestamp when the current rollout began.
+// The roll block writes RolloutInProgress=True via forceCondition before
+// advancing the DaemonSet template; this condition is only touched by the
+// roll block and patchStatus, never by the no-roll path, so it reliably
+// marks when THIS rollout started.
 func rolloutStartedAt(conditions []metav1.Condition) *metav1.Time {
 	for _, c := range conditions {
-		if c.Type == conditionTypeUnavailable && c.Status == metav1.ConditionFalse && c.Reason == "RollingUpdate" {
+		if c.Type == conditionTypeRolloutStart && c.Status == metav1.ConditionTrue {
 			return &c.LastTransitionTime
 		}
 	}
