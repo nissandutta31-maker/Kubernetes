@@ -283,10 +283,21 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	// rollout can still reach Failed after the window expires.
 	case pkg.Status.InstalledVersion != "" && pkg.Status.InstalledVersion != deployedVersion:
 		since := unavailableSince(pkg.Status.Conditions)
-		if allUnavailable && since != nil && time.Since(since.Time) > failureDetectionWindow {
+		rollStart := rolloutStartedAt(pkg.Status.Conditions)
+		// rollStalled: the roll block recorded a start time but the rollout has not
+		// completed within the detection window. This catches the common rolling-update
+		// failure mode where old pods stay Ready while new-revision pods crash, so
+		// allUnavailable never fires yet the upgrade makes no progress.
+		rollStalled := rollStart != nil && time.Since(rollStart.Time) > failureDetectionWindow
+		if (allUnavailable && since != nil && time.Since(since.Time) > failureDetectionWindow) || rollStalled {
 			phase = runtimev1alpha1.PackagePhaseFailed
-			message = fmt.Sprintf("upgrade failed: installer pods unavailable on all %d scheduled node(s); check pod logs",
-				ds.Status.DesiredNumberScheduled)
+			if allUnavailable {
+				message = fmt.Sprintf("upgrade failed: installer pods unavailable on all %d scheduled node(s); check pod logs",
+					ds.Status.DesiredNumberScheduled)
+			} else {
+				message = fmt.Sprintf("upgrade stalled: rollout to v%s did not complete within the detection window; check pod logs for updated pods",
+					deployedVersion)
+			}
 		} else {
 			phase = runtimev1alpha1.PackagePhaseUpgrading
 			message = fmt.Sprintf("rolling out: %d/%d pods updated to v%s",
@@ -585,6 +596,20 @@ func applyConfigEnv(current, desired []corev1.EnvVar) []corev1.EnvVar {
 func unavailableSince(conditions []metav1.Condition) *metav1.Time {
 	for _, c := range conditions {
 		if c.Type == conditionTypeUnavailable && c.Status == metav1.ConditionTrue {
+			return &c.LastTransitionTime
+		}
+	}
+	return nil
+}
+
+// rolloutStartedAt returns the time the AllPodsUnavailable condition last
+// transitioned to False. The roll block sets the condition to False before
+// updating the DaemonSet template, so its LastTransitionTime serves as the
+// rollout-start timestamp. setCondition preserves it while the status stays
+// False (i.e. while old-revision pods are still Running during the roll).
+func rolloutStartedAt(conditions []metav1.Condition) *metav1.Time {
+	for _, c := range conditions {
+		if c.Type == conditionTypeUnavailable && c.Status == metav1.ConditionFalse {
 			return &c.LastTransitionTime
 		}
 	}
