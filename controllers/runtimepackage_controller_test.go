@@ -472,3 +472,56 @@ func TestBuildDaemonSet_GPUToleration(t *testing.T) {
 	}
 	t.Error("DaemonSet missing nvidia.com/gpu toleration")
 }
+
+func TestReconcile_ConfigImageChangePreservesVersionGate(t *testing.T) {
+	// When InstallerImage is changed (config-driven image drift) while autoUpgrade=false
+	// and a version bump is pending, the image must update but PACKAGE_VERSION must NOT
+	// advance — the autoUpgrade gate must not be circumvented via an image override.
+	s := newTestScheme(t)
+	ctx := context.Background()
+	pkg := &runtimev1alpha1.RuntimePackage{
+		ObjectMeta: metav1.ObjectMeta{Name: "nct", Namespace: "nvidia-system"},
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:         "nvidia-container-toolkit",
+			Version:             "1.14.6",
+			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
+			InstallerImage:      "registry.example.com/toolkit:1.14.6",
+			AutoUpgrade:         false,
+		},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(pkg).WithStatusSubresource(pkg).Build()
+	r := &RuntimePackageReconciler{Client: fc, Scheme: s}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "nct", Namespace: "nvidia-system"}}
+	dsKey := types.NamespacedName{Name: DaemonSetName(pkg), Namespace: "nvidia-system"}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (create): %v", err)
+	}
+
+	// Bump version (pending, gated) AND change the installer image override (config).
+	cur := &runtimev1alpha1.RuntimePackage{}
+	if err := fc.Get(ctx, req.NamespacedName, cur); err != nil {
+		t.Fatalf("get pkg: %v", err)
+	}
+	cur.Spec.Version = "1.15.0"
+	cur.Spec.InstallerImage = "registry.example.com/toolkit:custom"
+	if err := fc.Update(ctx, cur); err != nil {
+		t.Fatalf("update pkg: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (config+version): %v", err)
+	}
+
+	ds := &appsv1.DaemonSet{}
+	if err := fc.Get(ctx, dsKey, ds); err != nil {
+		t.Fatalf("get ds: %v", err)
+	}
+	// Image must have updated (config change takes effect).
+	if got := ds.Spec.Template.Spec.Containers[0].Image; got != "registry.example.com/toolkit:custom" {
+		t.Errorf("image not updated for config change: got %q, want registry.example.com/toolkit:custom", got)
+	}
+	// PACKAGE_VERSION must NOT have advanced — autoUpgrade is still false.
+	if got := envValue(ds.Spec.Template.Spec.Containers[0].Env, "PACKAGE_VERSION"); got != "1.14.6" {
+		t.Errorf("autoUpgrade=false must preserve PACKAGE_VERSION: got %q, want 1.14.6", got)
+	}
+}

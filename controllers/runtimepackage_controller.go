@@ -177,19 +177,26 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 		})
 
 		// Config fields always apply immediately.
+		ds.Spec.Template.ObjectMeta.Labels = desiredDS.Spec.Template.ObjectMeta.Labels
 		ds.Spec.Template.Spec.NodeSelector = desiredDS.Spec.Template.Spec.NodeSelector
 		ds.Spec.Template.Spec.Containers[0].Args = desiredC.Args
 
-		if shouldRollVersion || !versionChanged || imageIsConfigDriven {
-			// Full update: version roll is permitted, nothing is version-blocked, or the
-			// image changed for a config reason. Applying the full env when the image
-			// changes for a config reason keeps image and PACKAGE_VERSION consistent.
+		if shouldRollVersion || !versionChanged {
+			// Full update: version roll is permitted, or no version change (config drift only).
+			// Apply full env so image and PACKAGE_VERSION stay consistent.
 			ds.Spec.Template.Spec.Containers[0].Image = desiredC.Image
 			ds.Spec.Template.Spec.Containers[0].Env = desiredC.Env
+		} else if imageIsConfigDriven {
+			// Config-driven image change (e.g. InstallerImage override changed or cleared)
+			// with a pending version bump gated by autoUpgrade=false. Apply the new image so
+			// the config change takes effect, but preserve PACKAGE_VERSION so the version
+			// gate is not circumvented.
+			ds.Spec.Template.Spec.Containers[0].Image = desiredC.Image
+			ds.Spec.Template.Spec.Containers[0].Env = applyConfigEnv(currentC.Env, desiredC.Env)
 		} else {
 			// Config-only roll: non-image config changed (e.g. validationScript) while a
-			// version bump is pending and autoUpgrade=false. Preserve the current image and
-			// PACKAGE_VERSION so the version gate is not circumvented.
+			// version bump is pending and autoUpgrade=false. Preserve current image and
+			// PACKAGE_VERSION.
 			ds.Spec.Template.Spec.Containers[0].Env = applyConfigEnv(currentC.Env, desiredC.Env)
 		}
 
@@ -246,12 +253,15 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 				ds.Status.DesiredNumberScheduled)
 		}
 
-	case desired > 0 &&
+	case deployedVersion != "" &&
+		desired > 0 &&
 		readyNodes == desired &&
 		ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled:
 		// Ready when every schedulable targeted node has the package on the current
-		// DaemonSet revision. Using DesiredNumberScheduled (the kubelet's count of
-		// schedulable pods) rather than totalNodes avoids blocking Ready when some
+		// DaemonSet revision. Guard on deployedVersion so a missing PACKAGE_VERSION env
+		// (e.g. a hand-crafted DaemonSet) does not falsely mark the package Ready with
+		// an empty InstalledVersion. Using DesiredNumberScheduled (the kubelet's count
+		// of schedulable pods) rather than totalNodes avoids blocking Ready when some
 		// matching nodes are cordoned or carry intolerable taints.
 		phase = runtimev1alpha1.PackagePhaseReady
 		installedVersion = deployedVersion
