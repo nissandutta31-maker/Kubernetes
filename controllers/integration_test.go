@@ -329,12 +329,14 @@ func TestIntegration_ReadyRequiresAllTargetedNodes(t *testing.T) {
 		t.Fatalf("reconcile #1: %v", err)
 	}
 
-	// Installer scheduled and ready on only 2 of the 3 targeted nodes.
+	// All 3 nodes are schedulable but only 2 pods are ready yet.
+	// DesiredNumberScheduled=3 means the DaemonSet expects pods on all 3 nodes;
+	// NumberReady=2 simulates one pod still initialising. Ready must not fire.
 	ds := &appsv1.DaemonSet{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: DaemonSetName(pkg), Namespace: ns}, ds); err != nil {
 		t.Fatalf("get ds: %v", err)
 	}
-	ds.Status.DesiredNumberScheduled = 2
+	ds.Status.DesiredNumberScheduled = 3
 	ds.Status.NumberReady = 2
 	if err := k8sClient.Status().Update(ctx, ds); err != nil {
 		t.Fatalf("set ds status: %v", err)

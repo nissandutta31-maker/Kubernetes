@@ -246,15 +246,16 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 				ds.Status.DesiredNumberScheduled)
 		}
 
-	case desired == totalNodes &&
-		readyNodes == totalNodes &&
+	case desired > 0 &&
+		readyNodes == desired &&
 		ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled:
-		// Ready only when every targeted node has the package installed on the current
-		// DaemonSet revision. Checking UpdatedNumberScheduled prevents prematurely
-		// reporting Ready while old pods are still being replaced during a rolling update.
+		// Ready when every schedulable targeted node has the package on the current
+		// DaemonSet revision. Using DesiredNumberScheduled (the kubelet's count of
+		// schedulable pods) rather than totalNodes avoids blocking Ready when some
+		// matching nodes are cordoned or carry intolerable taints.
 		phase = runtimev1alpha1.PackagePhaseReady
 		installedVersion = deployedVersion
-		message = fmt.Sprintf("%s v%s installed on %d node(s)", pkg.Spec.PackageName, deployedVersion, readyNodes)
+		message = fmt.Sprintf("%s v%s installed on %d/%d node(s)", pkg.Spec.PackageName, deployedVersion, readyNodes, totalNodes)
 
 	// Upgrade in progress: pods are rolling to a new revision. Only shown after at
 	// least one successful install (InstalledVersion set) to distinguish from the
