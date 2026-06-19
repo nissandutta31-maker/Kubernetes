@@ -10,6 +10,7 @@ target/
 .gradle/
 
 # Build artifacts
+bin/
 dist/
 build/
 *.pyc

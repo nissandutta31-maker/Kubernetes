@@ -353,12 +353,11 @@ func (r *RuntimePackageReconciler) patchStatus(
 	if installedVersion != "" {
 		pkg.Status.InstalledVersion = installedVersion
 	} else if phase == runtimev1alpha1.PackagePhaseFailed ||
-		phase == runtimev1alpha1.PackagePhasePending ||
-		phase == runtimev1alpha1.PackagePhaseInstalling {
-		// Clear InstalledVersion when the package is not confirmed running:
-		// Failed (broken), Pending (no matching nodes), or Installing (DaemonSet
-		// being created/recreated, pods not yet ready). Upgrading is exempt because
-		// it needs the previous InstalledVersion to detect upgrade progress.
+		phase == runtimev1alpha1.PackagePhasePending {
+		// Clear InstalledVersion when no nodes match (Pending) or installation
+		// is broken (Failed). Installing is intentionally excluded: a stale
+		// InstalledVersion is needed so the Upgrading case can detect that a
+		// version rollout is in progress (InstalledVersion != deployedVersion).
 		pkg.Status.InstalledVersion = ""
 	}
 
