@@ -189,11 +189,17 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 
 		// Record rollout-start time on a dedicated condition that the no-roll path
 		// never touches. forceCondition always refreshes LastTransitionTime so
-		// repeated rolls each get a fresh start timestamp.
+		// repeated rolls each get a fresh start timestamp. Reason distinguishes
+		// version rolls (used by rolloutStartedAt for stall detection and Upgrading
+		// phase continuity) from config-only rolls.
+		rollReason := "ConfigRoll"
+		if shouldRollVersion {
+			rollReason = "VersionRoll"
+		}
 		forceCondition(&pkg.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeRolloutStart,
 			Status:             metav1.ConditionTrue,
-			Reason:             "RollingUpdate",
+			Reason:             rollReason,
 			ObservedGeneration: pkg.Generation,
 			LastTransitionTime: metav1.Now(),
 		})
@@ -277,13 +283,14 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 		installedVersion = deployedVersion
 		message = fmt.Sprintf("%s v%s installed on %d/%d node(s)", pkg.Spec.PackageName, deployedVersion, readyNodes, totalNodes)
 
-	// Active version rollout: the DaemonSet template was advanced to a new version
-	// (deployedVersion) but InstalledVersion has not been confirmed yet. Use
-	// InstalledVersion != deployedVersion rather than UpdatedNumberScheduled < Desired
-	// so that node scale-out (new nodes getting the SAME version) is not misreported
-	// as an upgrade. Failure detection runs inside this case so a broken version
-	// rollout can still reach Failed after the window expires.
-	case pkg.Status.InstalledVersion != "" && pkg.Status.InstalledVersion != deployedVersion:
+	// Active version rollout: entered when a prior confirmed install is being upgraded
+	// (InstalledVersion differs from the deployed version), OR when a version roll was
+	// explicitly started but InstalledVersion is still empty (first-time install where
+	// spec.version was bumped before the initial Ready was ever reached). The second
+	// arm uses rolloutStartedAt (which only matches Reason=="VersionRoll") so
+	// config-only rolls do not fall into this branch.
+	case (pkg.Status.InstalledVersion != "" && pkg.Status.InstalledVersion != deployedVersion) ||
+		rolloutStartedAt(pkg.Status.Conditions) != nil:
 		since := unavailableSince(pkg.Status.Conditions)
 		rollStart := rolloutStartedAt(pkg.Status.Conditions)
 		// rollStalled: rollout started but no progress in the detection window,
@@ -631,14 +638,13 @@ func unavailableSince(conditions []metav1.Condition) *metav1.Time {
 	return nil
 }
 
-// rolloutStartedAt returns the timestamp when the current rollout began.
-// The roll block writes RolloutInProgress=True via forceCondition before
-// advancing the DaemonSet template; this condition is only touched by the
-// roll block and patchStatus, never by the no-roll path, so it reliably
-// marks when THIS rollout started.
+// rolloutStartedAt returns the timestamp when the current VERSION rollout began.
+// Only matches Reason=="VersionRoll" so config-only rolls (Reason=="ConfigRoll")
+// do not affect stall detection or the Upgrading phase branch. Returns nil when
+// no version rollout is in progress.
 func rolloutStartedAt(conditions []metav1.Condition) *metav1.Time {
 	for _, c := range conditions {
-		if c.Type == conditionTypeRolloutStart && c.Status == metav1.ConditionTrue {
+		if c.Type == conditionTypeRolloutStart && c.Status == metav1.ConditionTrue && c.Reason == "VersionRoll" {
 			return &c.LastTransitionTime
 		}
 	}
