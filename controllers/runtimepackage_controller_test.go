@@ -7,6 +7,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -436,8 +437,13 @@ func TestReconcile_PackageNameChange(t *testing.T) {
 	if err := fc.Update(ctx, cur); err != nil {
 		t.Fatalf("update pkg: %v", err)
 	}
+	// First reconcile after name change: detects selector mismatch, deletes old DaemonSet.
 	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("reconcile (name change): %v", err)
+		t.Fatalf("reconcile (name change, delete): %v", err)
+	}
+	// Second reconcile: old DS is gone, creates new DS with updated selector + labels.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (name change, recreate): %v", err)
 	}
 
 	ds := &appsv1.DaemonSet{}
@@ -523,5 +529,118 @@ func TestReconcile_ConfigImageChangePreservesVersionGate(t *testing.T) {
 	// PACKAGE_VERSION must NOT have advanced — autoUpgrade is still false.
 	if got := envValue(ds.Spec.Template.Spec.Containers[0].Env, "PACKAGE_VERSION"); got != "1.14.6" {
 		t.Errorf("autoUpgrade=false must preserve PACKAGE_VERSION: got %q, want 1.14.6", got)
+	}
+}
+
+func TestReconcile_ClearedOverrideAlwaysRolls(t *testing.T) {
+	// When spec.installerImage is cleared while spec.version is also bumped and
+	// autoUpgrade=false, the image change must still roll (it is config-driven:
+	// switching from a custom image to the NGC convention). PACKAGE_VERSION must
+	// NOT advance since the version gate is still closed.
+	s := newTestScheme(t)
+	ctx := context.Background()
+	pkg := &runtimev1alpha1.RuntimePackage{
+		ObjectMeta: metav1.ObjectMeta{Name: "nct", Namespace: "nvidia-system"},
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:         "nvidia-container-toolkit",
+			Version:             "1.14.6",
+			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
+			InstallerImage:      "registry.example.com/toolkit:1.14.6",
+			AutoUpgrade:         false,
+		},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(pkg).WithStatusSubresource(pkg).Build()
+	r := &RuntimePackageReconciler{Client: fc, Scheme: s}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "nct", Namespace: "nvidia-system"}}
+	dsKey := types.NamespacedName{Name: DaemonSetName(pkg), Namespace: "nvidia-system"}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (create): %v", err)
+	}
+
+	// Clear the override and bump the version simultaneously.
+	cur := &runtimev1alpha1.RuntimePackage{}
+	if err := fc.Get(ctx, req.NamespacedName, cur); err != nil {
+		t.Fatalf("get pkg: %v", err)
+	}
+	cur.Spec.InstallerImage = "" // cleared
+	cur.Spec.Version = "1.15.0" // bumped
+	if err := fc.Update(ctx, cur); err != nil {
+		t.Fatalf("update pkg: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (clear+bump): %v", err)
+	}
+
+	ds := &appsv1.DaemonSet{}
+	if err := fc.Get(ctx, dsKey, ds); err != nil {
+		t.Fatalf("get ds: %v", err)
+	}
+	// Clearing the override is config-driven — the DaemonSet must have rolled to the NGC image.
+	wantImage := "nvcr.io/nvidia/k8s/nvidia-container-toolkit-installer:1.15.0"
+	if got := ds.Spec.Template.Spec.Containers[0].Image; got != wantImage {
+		t.Errorf("image not updated after clearing override: got %q, want %q", got, wantImage)
+	}
+	// But autoUpgrade=false means PACKAGE_VERSION must not advance.
+	if got := envValue(ds.Spec.Template.Spec.Containers[0].Env, "PACKAGE_VERSION"); got != "1.14.6" {
+		t.Errorf("PACKAGE_VERSION must be preserved when autoUpgrade=false: got %q, want 1.14.6", got)
+	}
+}
+
+func TestReconcile_AllUnavailableDuringUpgradeReportsUpgrading(t *testing.T) {
+	// During a rolling update (UpdatedNumberScheduled < DesiredNumberScheduled),
+	// all installer pods can be briefly unavailable. The controller must report
+	// Upgrading, not Installing or Failed.
+	s := newTestScheme(t)
+	ctx := context.Background()
+	pkg := &runtimev1alpha1.RuntimePackage{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nct",
+			Namespace: "nvidia-system",
+		},
+		Spec: runtimev1alpha1.RuntimePackageSpec{
+			PackageName:         "nvidia-container-toolkit",
+			Version:             "1.14.6",
+			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
+			AutoUpgrade:         true,
+		},
+		Status: runtimev1alpha1.RuntimePackageStatus{
+			// Simulate a previously successful install.
+			InstalledVersion: "1.14.6",
+		},
+	}
+	// Add two GPU nodes so countMatchingNodes returns 2 instead of 0
+	// (otherwise totalNodes==0 short-circuits to Pending before the Upgrading check).
+	node1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "gpu-node-1",
+		Labels: map[string]string{"nvidia.com/gpu.present": "true"}}}
+	node2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "gpu-node-2",
+		Labels: map[string]string{"nvidia.com/gpu.present": "true"}}}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(pkg, node1, node2).WithStatusSubresource(pkg).Build()
+	r := &RuntimePackageReconciler{Client: fc, Scheme: s}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "nct", Namespace: "nvidia-system"}}
+
+	// Create the DaemonSet as if it were mid-rollout to 1.15.0: 2 pods scheduled,
+	// only 1 updated, all pods temporarily unavailable.
+	ds := buildDaemonSet(pkg)
+	if err := fc.Create(ctx, ds); err != nil {
+		t.Fatalf("create ds: %v", err)
+	}
+	ds.Status.DesiredNumberScheduled = 2
+	ds.Status.NumberUnavailable = 2
+	ds.Status.UpdatedNumberScheduled = 1 // rollout incomplete
+	if err := fc.Status().Update(ctx, ds); err != nil {
+		t.Fatalf("update ds status: %v", err)
+	}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	got := &runtimev1alpha1.RuntimePackage{}
+	if err := fc.Get(ctx, req.NamespacedName, got); err != nil {
+		t.Fatalf("get pkg: %v", err)
+	}
+	if got.Status.Phase != runtimev1alpha1.PackagePhaseUpgrading {
+		t.Errorf("all-pods-unavailable during rollout: want Upgrading, got %q", got.Status.Phase)
 	}
 }

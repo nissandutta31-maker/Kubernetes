@@ -135,6 +135,21 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	desiredC := desiredDS.Spec.Template.Spec.Containers[0]
 	currentC := ds.Spec.Template.Spec.Containers[0]
 
+	// Selector is immutable in Kubernetes. If spec.packageName changed, the desired
+	// selector (which includes runtime.nvidia.com/package) no longer matches.
+	// Delete the stale DaemonSet and requeue; createDaemonSet runs on the next
+	// reconcile once the old one is fully removed.
+	if !equalStringMap(ds.Spec.Selector.MatchLabels, desiredDS.Spec.Selector.MatchLabels) {
+		if ds.DeletionTimestamp.IsZero() {
+			log.FromContext(ctx).Info("DaemonSet selector mismatch; deleting stale DaemonSet", "name", ds.Name)
+			if err := r.Delete(ctx, ds); err != nil && !errors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("deleting stale DaemonSet: %w", err)
+			}
+		}
+		return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseInstalling, "", 0, totalNodes,
+			fmt.Sprintf("recreating installer DaemonSet for %s", pkg.Spec.PackageName))
+	}
+
 	// The version actually deployed is whatever the running DaemonSet's pods carry,
 	// not what the spec currently asks for. Reading it from the pod template keeps
 	// status honest when an upgrade is gated or the installer image is pinned.
@@ -148,7 +163,12 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 	// config-driven and always apply, with full env so image and PACKAGE_VERSION stay
 	// in sync.
 	imageDrift := currentC.Image != desiredC.Image
-	imageIsVersionDriven := versionChanged && pkg.Spec.InstallerImage == ""
+	// An image change is version-driven only when the currently-running image already
+	// came from the NGC convention (InstallerImage was not set when the DaemonSet was
+	// last rolled) AND InstallerImage is still empty. Clearing an override (custom→NGC)
+	// is a config change that must always roll regardless of autoUpgrade.
+	currentIsNGC := currentC.Image == fmt.Sprintf("nvcr.io/nvidia/k8s/%s-installer:%s", pkg.Spec.PackageName, deployedVersion)
+	imageIsVersionDriven := versionChanged && pkg.Spec.InstallerImage == "" && currentIsNGC
 	imageIsConfigDriven := imageDrift && !imageIsVersionDriven
 
 	// configDrift: non-version fields that always roll, independent of autoUpgrade.
@@ -239,6 +259,17 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 		phase = runtimev1alpha1.PackagePhasePending
 		message = "waiting for nodes matching the node selector"
 
+	// Upgrade in progress: checked before allUnavailable so that brief pod
+	// unavailability during a rolling update does not flip the phase to
+	// Installing or (after the window expires) Failed. Only shown after at least
+	// one confirmed install (InstalledVersion set) to distinguish from the initial
+	// install where UpdatedNumberScheduled also starts at zero.
+	case pkg.Status.InstalledVersion != "" &&
+		ds.Status.UpdatedNumberScheduled < ds.Status.DesiredNumberScheduled:
+		phase = runtimev1alpha1.PackagePhaseUpgrading
+		message = fmt.Sprintf("rolling out: %d/%d pods updated to v%s",
+			ds.Status.UpdatedNumberScheduled, ds.Status.DesiredNumberScheduled, pkg.Spec.Version)
+
 	case allUnavailable:
 		// All pods unavailable: flip to Failed once the detection window expires,
 		// measured from when the AllPodsUnavailable condition was last set True.
@@ -266,15 +297,6 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 		phase = runtimev1alpha1.PackagePhaseReady
 		installedVersion = deployedVersion
 		message = fmt.Sprintf("%s v%s installed on %d/%d node(s)", pkg.Spec.PackageName, deployedVersion, readyNodes, totalNodes)
-
-	// Upgrade in progress: pods are rolling to a new revision. Only shown after at
-	// least one successful install (InstalledVersion set) to distinguish from the
-	// initial install where UpdatedNumberScheduled also starts at zero.
-	case pkg.Status.InstalledVersion != "" &&
-		ds.Status.UpdatedNumberScheduled < ds.Status.DesiredNumberScheduled:
-		phase = runtimev1alpha1.PackagePhaseUpgrading
-		message = fmt.Sprintf("rolling out: %d/%d pods updated to v%s",
-			ds.Status.UpdatedNumberScheduled, ds.Status.DesiredNumberScheduled, pkg.Spec.Version)
 
 	default:
 		phase = runtimev1alpha1.PackagePhaseInstalling
