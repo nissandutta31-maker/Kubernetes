@@ -12,7 +12,7 @@ all: build
 
 ## build: compile the operator binary
 build:
-	go build -o bin/manager ./...
+	go build -o bin/manager .
 
 ## test: run unit tests with race detection
 test:
