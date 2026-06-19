@@ -224,8 +224,13 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 			return ctrl.Result{}, fmt.Errorf("updating DaemonSet: %w", err)
 		}
 		// Leave InstalledVersion untouched until the new pods are confirmed ready.
-		return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseUpgrading, "", ds.Status.NumberReady, totalNodes,
-			fmt.Sprintf("rolling out %s v%s", pkg.Spec.PackageName, pkg.Spec.Version))
+		// Report Upgrading only for an actual version roll; config-only rolls report Installing.
+		if shouldRollVersion {
+			return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseUpgrading, "", ds.Status.NumberReady, totalNodes,
+				fmt.Sprintf("upgrading %s to v%s", pkg.Spec.PackageName, pkg.Spec.Version))
+		}
+		return r.patchStatus(ctx, pkg, runtimev1alpha1.PackagePhaseInstalling, "", ds.Status.NumberReady, totalNodes,
+			fmt.Sprintf("applying config update to %s", pkg.Spec.PackageName))
 	}
 
 	// No roll: track all-pods-unavailable onset for failure detection.
@@ -259,20 +264,38 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 		phase = runtimev1alpha1.PackagePhasePending
 		message = "waiting for nodes matching the node selector"
 
-	// Upgrade in progress: checked before allUnavailable so that brief pod
-	// unavailability during a rolling update does not flip the phase to
-	// Installing or (after the window expires) Failed. Only shown after at least
-	// one confirmed install (InstalledVersion set) to distinguish from the initial
-	// install where UpdatedNumberScheduled also starts at zero.
-	case pkg.Status.InstalledVersion != "" &&
-		ds.Status.UpdatedNumberScheduled < ds.Status.DesiredNumberScheduled:
-		phase = runtimev1alpha1.PackagePhaseUpgrading
-		message = fmt.Sprintf("rolling out: %d/%d pods updated to v%s",
-			ds.Status.UpdatedNumberScheduled, ds.Status.DesiredNumberScheduled, pkg.Spec.Version)
+	case deployedVersion != "" &&
+		desired > 0 &&
+		readyNodes == desired &&
+		ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled:
+		// Ready: every schedulable node has the package on the current DaemonSet revision.
+		// Evaluated before the Upgrading case so a rollout that just completed and left all
+		// pods ready is immediately promoted to Ready without waiting one more cycle.
+		phase = runtimev1alpha1.PackagePhaseReady
+		installedVersion = deployedVersion
+		message = fmt.Sprintf("%s v%s installed on %d/%d node(s)", pkg.Spec.PackageName, deployedVersion, readyNodes, totalNodes)
+
+	// Active version rollout: the DaemonSet template was advanced to a new version
+	// (deployedVersion) but InstalledVersion has not been confirmed yet. Use
+	// InstalledVersion != deployedVersion rather than UpdatedNumberScheduled < Desired
+	// so that node scale-out (new nodes getting the SAME version) is not misreported
+	// as an upgrade. Failure detection runs inside this case so a broken version
+	// rollout can still reach Failed after the window expires.
+	case pkg.Status.InstalledVersion != "" && pkg.Status.InstalledVersion != deployedVersion:
+		since := unavailableSince(pkg.Status.Conditions)
+		if allUnavailable && since != nil && time.Since(since.Time) > failureDetectionWindow {
+			phase = runtimev1alpha1.PackagePhaseFailed
+			message = fmt.Sprintf("upgrade failed: installer pods unavailable on all %d scheduled node(s); check pod logs",
+				ds.Status.DesiredNumberScheduled)
+		} else {
+			phase = runtimev1alpha1.PackagePhaseUpgrading
+			message = fmt.Sprintf("rolling out: %d/%d pods updated to v%s",
+				ds.Status.UpdatedNumberScheduled, ds.Status.DesiredNumberScheduled, deployedVersion)
+		}
 
 	case allUnavailable:
-		// All pods unavailable: flip to Failed once the detection window expires,
-		// measured from when the AllPodsUnavailable condition was last set True.
+		// All pods unavailable with no version rollout in progress: flip to Failed
+		// once the detection window expires.
 		since := unavailableSince(pkg.Status.Conditions)
 		if since != nil && time.Since(since.Time) > failureDetectionWindow {
 			phase = runtimev1alpha1.PackagePhaseFailed
@@ -283,20 +306,6 @@ func (r *RuntimePackageReconciler) syncDaemonSet(ctx context.Context, pkg *runti
 			message = fmt.Sprintf("waiting for pods: all %d scheduled pod(s) currently unavailable",
 				ds.Status.DesiredNumberScheduled)
 		}
-
-	case deployedVersion != "" &&
-		desired > 0 &&
-		readyNodes == desired &&
-		ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled:
-		// Ready when every schedulable targeted node has the package on the current
-		// DaemonSet revision. Guard on deployedVersion so a missing PACKAGE_VERSION env
-		// (e.g. a hand-crafted DaemonSet) does not falsely mark the package Ready with
-		// an empty InstalledVersion. Using DesiredNumberScheduled (the kubelet's count
-		// of schedulable pods) rather than totalNodes avoids blocking Ready when some
-		// matching nodes are cordoned or carry intolerable taints.
-		phase = runtimev1alpha1.PackagePhaseReady
-		installedVersion = deployedVersion
-		message = fmt.Sprintf("%s v%s installed on %d/%d node(s)", pkg.Spec.PackageName, deployedVersion, readyNodes, totalNodes)
 
 	default:
 		phase = runtimev1alpha1.PackagePhaseInstalling
@@ -330,6 +339,10 @@ func (r *RuntimePackageReconciler) patchStatus(
 
 	if installedVersion != "" {
 		pkg.Status.InstalledVersion = installedVersion
+	} else if phase == runtimev1alpha1.PackagePhaseFailed {
+		// Clear InstalledVersion on failure so status does not imply the package
+		// is still working at the previously installed version.
+		pkg.Status.InstalledVersion = ""
 	}
 
 	condStatus := metav1.ConditionFalse

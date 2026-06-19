@@ -588,9 +588,9 @@ func TestReconcile_ClearedOverrideAlwaysRolls(t *testing.T) {
 }
 
 func TestReconcile_AllUnavailableDuringUpgradeReportsUpgrading(t *testing.T) {
-	// During a rolling update (UpdatedNumberScheduled < DesiredNumberScheduled),
-	// all installer pods can be briefly unavailable. The controller must report
-	// Upgrading, not Installing or Failed.
+	// During a rolling update, all installer pods can be briefly unavailable.
+	// The controller must report Upgrading (not Installing or Failed) when
+	// InstalledVersion lags behind the deployed template version.
 	s := newTestScheme(t)
 	ctx := context.Background()
 	pkg := &runtimev1alpha1.RuntimePackage{
@@ -600,12 +600,12 @@ func TestReconcile_AllUnavailableDuringUpgradeReportsUpgrading(t *testing.T) {
 		},
 		Spec: runtimev1alpha1.RuntimePackageSpec{
 			PackageName:         "nvidia-container-toolkit",
-			Version:             "1.14.6",
+			Version:             "1.15.0", // template already rolled to new version
 			TargetArchitectures: []runtimev1alpha1.GPUArchitecture{runtimev1alpha1.ArchH100},
 			AutoUpgrade:         true,
 		},
 		Status: runtimev1alpha1.RuntimePackageStatus{
-			// Simulate a previously successful install.
+			// Previous confirmed install at the OLD version — triggers Upgrading.
 			InstalledVersion: "1.14.6",
 		},
 	}
